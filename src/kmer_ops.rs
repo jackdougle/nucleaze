@@ -1,6 +1,5 @@
 use std::cmp::min;
 use std::u64;
-
 use rustc_hash::FxHashSet;
 
 /// K-mer processor for building reference indices and filtering reads
@@ -102,12 +101,16 @@ impl KmerProcessor {
 /// A=00, C=01, G=10, T=11
 #[inline(always)]
 pub fn encode_forward(seq: &[u8]) -> u64 {
-    static FORWARD_BASE_TABLE: [u8; 85] = {
-        let mut bases = [0u8; 85];
+    static FORWARD_BASE_TABLE: [u8; 117] = {
+        let mut bases = [0u8; 117];
         bases[b'A' as usize] = 0b00;
         bases[b'C' as usize] = 0b01;
         bases[b'G' as usize] = 0b10;
         bases[b'T' as usize] = 0b11;
+        bases[b'a' as usize] = 0b00;
+        bases[b'c' as usize] = 0b01;
+        bases[b'g' as usize] = 0b10;
+        bases[b't' as usize] = 0b11;
         bases
     };
 
@@ -122,12 +125,16 @@ pub fn encode_forward(seq: &[u8]) -> u64 {
 /// A=11, C=10, G=01, T=00 (complement mapping)
 #[inline(always)]
 pub fn encode_reverse(seq: &[u8]) -> u64 {
-    static REVERSE_BASE_TABLE: [u8; 85] = {
-        let mut bases = [0u8; 85];
-        bases[b'A' as usize] = 0b11; // T complement
-        bases[b'C' as usize] = 0b10; // G complement
-        bases[b'G' as usize] = 0b01; // C complement
-        bases[b'T' as usize] = 0b00; // A complement
+    static REVERSE_BASE_TABLE: [u8; 117] = {
+        let mut bases = [0u8; 117];
+        bases[b'A' as usize] = 0b11;
+        bases[b'C' as usize] = 0b10;
+        bases[b'G' as usize] = 0b01;
+        bases[b'T' as usize] = 0b00;
+        bases[b'a' as usize] = 0b11;
+        bases[b'c' as usize] = 0b10;
+        bases[b'g' as usize] = 0b01;
+        bases[b't' as usize] = 0b00;
         bases
     };
 
