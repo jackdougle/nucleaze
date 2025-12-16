@@ -689,7 +689,7 @@ fn write_read(
             }
         }
     } else {
-        if format == "fa" || format == "fna" || format == "fasta" {
+        if ["fa", "fna", "fasta"].contains(&format) {
             writer.write_all(b">")?;
             writer.write_all(id)?;
             writer.write_all(b"\n")?;

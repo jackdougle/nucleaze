@@ -1,5 +1,6 @@
 use std::cmp::min;
 use std::u64;
+
 use rustc_hash::FxHashSet;
 
 /// K-mer processor for building reference indices and filtering reads
@@ -127,10 +128,10 @@ pub fn encode_forward(seq: &[u8]) -> u64 {
 pub fn encode_reverse(seq: &[u8]) -> u64 {
     static REVERSE_BASE_TABLE: [u8; 117] = {
         let mut bases = [0u8; 117];
-        bases[b'A' as usize] = 0b11;
-        bases[b'C' as usize] = 0b10;
-        bases[b'G' as usize] = 0b01;
-        bases[b'T' as usize] = 0b00;
+        bases[b'A' as usize] = 0b11; // T complement
+        bases[b'C' as usize] = 0b10; // G complement
+        bases[b'G' as usize] = 0b01; // C complement
+        bases[b'T' as usize] = 0b00; // A complement
         bases[b'a' as usize] = 0b11;
         bases[b'c' as usize] = 0b10;
         bases[b'g' as usize] = 0b01;
