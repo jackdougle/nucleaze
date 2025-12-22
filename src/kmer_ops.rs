@@ -53,6 +53,7 @@ impl KmerProcessor {
             }
             // Store canonical k-mer (smaller of forward/RC)
             self.ref_kmers.insert(min(forward_kmer, reverse_kmer));
+            println!("{:?}", &self.ref_kmers);
         }
     }
 
@@ -99,19 +100,21 @@ impl KmerProcessor {
 }
 
 /// Encode nucleotide sequence to 2-bit representation in forward orientation
-/// A=00, C=01, G=10, T=11
+/// A=00, C=01, G=10, T/U=11
 #[inline(always)]
 pub fn encode_forward(seq: &[u8]) -> u64 {
-    static FORWARD_BASE_TABLE: [u8; 117] = {
-        let mut bases = [0u8; 117];
+    static FORWARD_BASE_TABLE: [u8; 118] = {
+        let mut bases = [0u8; 118];
         bases[b'A' as usize] = 0b00;
         bases[b'C' as usize] = 0b01;
         bases[b'G' as usize] = 0b10;
         bases[b'T' as usize] = 0b11;
+        bases[b'U' as usize] = 0b11;
         bases[b'a' as usize] = 0b00;
         bases[b'c' as usize] = 0b01;
         bases[b'g' as usize] = 0b10;
         bases[b't' as usize] = 0b11;
+        bases[b'u' as usize] = 0b11;
         bases
     };
 
@@ -126,16 +129,18 @@ pub fn encode_forward(seq: &[u8]) -> u64 {
 /// A=11, C=10, G=01, T=00 (complement mapping)
 #[inline(always)]
 pub fn encode_reverse(seq: &[u8]) -> u64 {
-    static REVERSE_BASE_TABLE: [u8; 117] = {
-        let mut bases = [0u8; 117];
+    static REVERSE_BASE_TABLE: [u8; 118] = {
+        let mut bases = [0u8; 118];
         bases[b'A' as usize] = 0b11; // T complement
         bases[b'C' as usize] = 0b10; // G complement
         bases[b'G' as usize] = 0b01; // C complement
         bases[b'T' as usize] = 0b00; // A complement
+        bases[b'U' as usize] = 0b00; // RNA A complement
         bases[b'a' as usize] = 0b11;
         bases[b'c' as usize] = 0b10;
         bases[b'g' as usize] = 0b01;
         bases[b't' as usize] = 0b00;
+        bases[b'u' as usize] = 0b00;
         bases
     };
 

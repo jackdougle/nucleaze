@@ -2,13 +2,13 @@ mod core;
 mod kmer_ops;
 
 use clap::Parser;
+use rlimit::{Resource, setrlimit};
 use std::io;
 use std::time::Instant;
-use rlimit::{Resource, setrlimit};
 
-const ABOUT: &str = "Nucleaze 1.2.1
+const ABOUT: &str = "Nucleaze 1.3.0
 Written by Jack Douglass
-Last modified November 29, 2025
+Last modified December 19, 2025
 
 Nucleaze compares DNA sequences from input file to DNA sequences from reference
  file using k-mer analysis. Splits up reference file sequences into k-mers of
@@ -163,19 +163,18 @@ fn main() -> io::Result<()> {
 }
 
 fn parse_memory_size(input: &str) -> Result<u64, String> {
-    let s = input.trim();
-    let s_up = s.to_uppercase();
+    let s = input.trim().to_uppercase();
 
     // Split into (number, suffix)
-    let (num_str, multiplier) = match s_up.strip_suffix('G') {
+    let (num_str, multiplier) = match s.strip_suffix('G') {
         Some(n) => (n, 1024_u64.pow(3)),
-        None => match s_up.strip_suffix('M') {
+        None => match s.strip_suffix('M') {
             Some(n) => (n, 1024_u64.pow(2)),
-            None => match s_up.strip_suffix('K') {
+            None => match s.strip_suffix('K') {
                 Some(n) => (n, 1024_u64),
-                None => match s_up.strip_suffix('B') {
+                None => match s.strip_suffix('B') {
                     Some(n) => (n, 1),
-                    None => (s_up.as_str(), 1), // no unit
+                    None => (s.as_str(), 1), // no unit
                 },
             },
         },
@@ -186,7 +185,6 @@ fn parse_memory_size(input: &str) -> Result<u64, String> {
         .map(|n| n * multiplier)
         .map_err(|_| format!("Invalid size format: '{}'", input))
 }
-
 
 /// Validate command-line arguments to catch common errors early
 fn validate_args(args: &Args) -> io::Result<()> {

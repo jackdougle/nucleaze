@@ -54,7 +54,9 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let ref_path = args.r#ref.unwrap_or_default();
     let bin_kmers_path = &args.binref.unwrap_or_default();
     if ref_path.is_empty() && bin_kmers_path.is_empty() {
-        eprintln!("Error: Please provide either a reference file (--ref) or a binary k-mer index file (--binref).");
+        eprintln!(
+            "Error: Please provide either a reference file (--ref) or a binary k-mer index file (--binref)."
+        );
         std::process::exit(1);
     }
 
@@ -73,15 +75,15 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
         }
         Err(e) => {
             eprintln!("\nInvalid serialized reference file: {}", e);
-            
+
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-                println!("Loading ref k-mers from {}", ref_path);
-                println!(
-                    "Added {} from {}",
-                    kmer_processor.ref_kmers.iter().size_hint().0 - 1,
-                    ref_path,
-                );
+                    println!("Loading reference k-mers from {}", ref_path);
+                    println!(
+                        "Added {} from {}",
+                        kmer_processor.ref_kmers.iter().size_hint().0 - 1,
+                        ref_path,
+                    );
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
@@ -149,11 +151,11 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 mbase_count + ubase_count
             );
             println!(
-                "Matches:\t\t{} reads ({:.2}%) \t\t{} bases ({:.2}%)",
+                "Matches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)",
                 mseq_count, matched_percent, mbase_count, mbase_percent
             );
             println!(
-                "Nonmatches:\t\t{} reads ({:.2}%)\t\t{} bases ({:.2}%)\n",
+                "Nonmatches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)\n",
                 useq_count, unmatched_percent, ubase_count, ubase_percent
             );
         }
@@ -179,7 +181,9 @@ fn load_serialized_kmers(
     let size_metadata = u64::MAX ^ processor.k as u64;
     if !processor.ref_kmers.contains(&size_metadata) {
         processor.ref_kmers.clear();
-        return Err(format!("k-mers are of different length than specified k (default k = 21)").into());
+        return Err(
+            format!("k-mers are of different length than specified k (default k = 21)").into(),
+        );
     }
 
     Ok(())
@@ -192,7 +196,6 @@ fn get_reference_kmers(
 ) -> Result<(), Box<dyn Error>> {
     let ref_filename = ref_path.split(',');
     for ref_path in ref_filename {
-        println!("Loading reference k-mers from {}", ref_path);
         let mut reader = parse_fastx_file(ref_path)?;
 
         while let Some(record) = reader.next() {
@@ -200,7 +203,7 @@ fn get_reference_kmers(
             processor.process_ref(&record.seq());
         }
     }
-    
+
     Ok(())
 }
 
