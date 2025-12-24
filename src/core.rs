@@ -146,7 +146,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             println!("Processing time:\t{:.3} seconds", end_time - indexing_time);
 
             println!(
-                "\nInput:\t\t\t{} reads\t\t\t{} bases",
+                "\nInput:\t\t\t{} reads\t\t{} bases",
                 read_count,
                 mbase_count + ubase_count
             );
@@ -160,7 +160,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             );
         }
         Err(e) => {
-            eprintln!("\nError processing reads:\n{}", e);
+            eprintln!("\nError pr cessing reads:\n{}", e);
         }
     }
 
@@ -194,8 +194,17 @@ fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
-    let ref_filename = ref_path.split(',');
-    for ref_path in ref_filename {
+    let ref_filenames: Vec<&str> = ref_path.split(',').collect();
+
+    // Pre-allocate based on total file size
+    let total_bytes: u64 = ref_filenames.iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|m| m.len())
+        .sum();
+    processor.reserve_for_ref_size(total_bytes as usize);
+
+    for ref_path in ref_filenames {
+        println!("Loading reference k-mers from {}", ref_path);
         let mut reader = parse_fastx_file(ref_path)?;
 
         while let Some(record) = reader.next() {

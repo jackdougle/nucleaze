@@ -59,6 +59,8 @@ MEMORY & PERFORMANCE PARAMETERS
                         reads, omit flag for unpaired reads.
     --order             (-o) Enable flag to get read outputs ordered by
                         sequence ID.
+    --canonical         (-c) K-mers are stored and compared in canonical form 
+                        (lowest of forward and reverse-complement).
 
 Function and usage documentation at /README.md.
 Contact jack.gdouglass@gmail.com for any questions or issues encountered.
@@ -126,6 +128,10 @@ struct Args {
     /// Enabling flag causes ordered output
     #[arg(short, long)]
     order: bool,
+
+    /// Enabling flag uses canonical k-mers for comparison
+    #[arg(short, long)]
+    canonical: bool,
 }
 
 fn main() -> io::Result<()> {

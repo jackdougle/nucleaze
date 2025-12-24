@@ -1,13 +1,11 @@
-use std::cmp::min;
-use std::u64;
-
+use std::{cmp::min, u64};
 use rustc_hash::FxHashSet;
 
 /// K-mer processor for building reference indices and filtering reads
 pub struct KmerProcessor {
     pub k: usize,                  // k-mer size in bases
     pub threshold: u8,             // minimum k-mer hits to consider a match
-    pub ref_kmers: FxHashSet<u64>, // set of canonical k-mers from reference
+    pub ref_kmers: FxHashSet<u64>,  // set of canonical k-mers from reference
     pub bit_cap: u64,              // bitmask for k-mer length
 }
 
@@ -21,8 +19,17 @@ impl KmerProcessor {
         }
     }
 
+    /// Pre-allocate capacity based on expected reference size in bytes.
+    /// Assumes ~1 unique kmer per byte, targeting 75% load factor on actual slots.
+    pub fn reserve_for_ref_size(&mut self, ref_bytes: usize) {
+        // Target: N / actual_slots = 0.75, so actual_slots = 4N/3
+        // reserve(C) allocates ~(8C/7) actual slots
+        // Solve: 8C/7 = 4N/3 → C = 7N/6
+        let capacity = ref_bytes * 7 / 6;
+        self.ref_kmers.reserve(capacity);
+    }
+
     /// Build reference k-mer index from a sequence
-    /// Stores canonical k-mers (lexicographically smaller of forward/reverse complement)
     pub fn process_ref(&mut self, ref_seq: &[u8]) {
         if ref_seq.len() < self.k {
             panic!("Read sequence is shorter than k");
@@ -40,20 +47,27 @@ impl KmerProcessor {
         for i in 0..=ref_seq.len() - self.k {
             if i == 0 {
                 // Encode first k-mer from scratch
-                forward_kmer = encode_forward(&ref_seq[0..self.k]);
-                reverse_kmer = encode_reverse(&ref_seq[0..self.k]);
+                forward_kmer = match encode_forward(&ref_seq[0..self.k]) {
+                    Some(kmer) => kmer,
+                    None => continue, // skip ambiguous k-mers
+                };
+                reverse_kmer = encode_reverse(&ref_seq[0..self.k]).unwrap();
             } else {
-                // Sliding window: shift left and add new base
-                forward_kmer = ((forward_kmer << 2) | encode_forward(&[ref_seq[i + self.k - 1]]))
-                    & self.bit_cap;
-                // Sliding window: shift right and add new base at MSB
-                reverse_kmer = ((reverse_kmer >> 2)
-                    | (encode_reverse(&[ref_seq[i + self.k - 1]]) << (2 * (self.k - 1))))
-                    & self.bit_cap;
+                let new_base = match encode_forward(&[ref_seq[i + self.k - 1]]) {
+                    Some(b) => b,
+                    None => {
+                        // Ambiguous base, reset k-mer construction
+                        forward_kmer = 0b00;
+                        reverse_kmer = 0b00;
+                        continue;
+                    }
+                };
+                forward_kmer = ((forward_kmer << 2) | new_base) & self.bit_cap; 
+                reverse_kmer = ((reverse_kmer >> 2) | (encode_reverse(&[ref_seq[i + self.k - 1]]).unwrap()
+                    << (2 * (self.k - 1)))) & self.bit_cap;
             }
             // Store canonical k-mer (smaller of forward/RC)
             self.ref_kmers.insert(min(forward_kmer, reverse_kmer));
-            println!("{:?}", &self.ref_kmers);
         }
     }
 
@@ -75,14 +89,25 @@ impl KmerProcessor {
 
         for i in 0..=read_seq.len() - self.k {
             if i == 0 {
-                forward_kmer = encode_forward(&read_seq[0..self.k]);
-                reverse_kmer = encode_reverse(&read_seq[0..self.k]);
+                forward_kmer = match encode_forward(&read_seq[0..self.k]) {
+                    Some(kmer) => kmer,
+                    None => continue, // skip ambiguous k-mers
+                    
+                };
+                reverse_kmer = encode_reverse(&read_seq[0..self.k]).unwrap();
             } else {
-                forward_kmer = ((forward_kmer << 2) | encode_forward(&[read_seq[i + self.k - 1]]))
-                    & self.bit_cap;
-                reverse_kmer = ((reverse_kmer >> 2)
-                    | (encode_reverse(&[read_seq[i + self.k - 1]]) << (2 * (self.k - 1))))
-                    & self.bit_cap;
+                let new_base = match encode_forward(&[read_seq[i + self.k - 1]]) {
+                    Some(b) => b,
+                    None => {
+                        // Ambiguous base, reset k-mer construction
+                        forward_kmer = 0b00;
+                        reverse_kmer = 0b00;
+                        continue;
+                    }
+                };
+                forward_kmer = ((forward_kmer << 2) | new_base) & self.bit_cap;
+                reverse_kmer = ((reverse_kmer >> 2) | (encode_reverse(&[read_seq[i + self.k - 1]]).unwrap()
+                    << (2 * (self.k - 1)))) & self.bit_cap;
             }
 
             let canonical = min(forward_kmer, reverse_kmer);
@@ -102,9 +127,11 @@ impl KmerProcessor {
 /// Encode nucleotide sequence to 2-bit representation in forward orientation
 /// A=00, C=01, G=10, T/U=11
 #[inline(always)]
-pub fn encode_forward(seq: &[u8]) -> u64 {
-    static FORWARD_BASE_TABLE: [u8; 118] = {
-        let mut bases = [0u8; 118];
+pub fn encode_forward(seq: &[u8]) -> Option<u64> {
+    const INVALID: u8 = 0xFF;
+
+    static FORWARD_BASE_TABLE: [u8; 128] = {
+        let mut bases = [INVALID; 128];
         bases[b'A' as usize] = 0b00;
         bases[b'C' as usize] = 0b01;
         bases[b'G' as usize] = 0b10;
@@ -118,19 +145,28 @@ pub fn encode_forward(seq: &[u8]) -> u64 {
         bases
     };
 
-    seq.iter().fold(0u64, |encoded, &base| {
-        let val = FORWARD_BASE_TABLE[base as usize];
-        debug_assert!(val <= 0b11, "Invalid base: {}", base as char);
-        (encoded << 2) | val as u64
-    })
+    let mut encoded = 0u64;
+
+    for &b in seq {
+        let v = unsafe { *FORWARD_BASE_TABLE.get_unchecked(b as usize) };
+        if v == INVALID {
+            return None; // ambiguous base
+        }
+
+        encoded = (encoded << 2) | v as u64;
+    }
+
+    Some(encoded)
 }
 
 /// Encode nucleotide sequence to 2-bit representation in reverse complement orientation
 /// A=11, C=10, G=01, T=00 (complement mapping)
 #[inline(always)]
-pub fn encode_reverse(seq: &[u8]) -> u64 {
-    static REVERSE_BASE_TABLE: [u8; 118] = {
-        let mut bases = [0u8; 118];
+pub fn encode_reverse(seq: &[u8]) -> Option<u64> {
+    const INVALID: u8 = 0xFF;
+
+    static REVERSE_BASE_TABLE: [u8; 128] = {
+        let mut bases = [INVALID; 128];
         bases[b'A' as usize] = 0b11; // T complement
         bases[b'C' as usize] = 0b10; // G complement
         bases[b'G' as usize] = 0b01; // C complement
@@ -144,11 +180,18 @@ pub fn encode_reverse(seq: &[u8]) -> u64 {
         bases
     };
 
-    seq.iter().rev().fold(0u64, |encoded, &base| {
-        let val = REVERSE_BASE_TABLE[base as usize];
-        debug_assert!(val <= 0b11, "Invalid base: {}", base as char);
-        (encoded << 2) | val as u64
-    })
+    let mut encoded = 0u64;
+
+    for &b in seq.iter().rev() {
+        let v = unsafe { *REVERSE_BASE_TABLE.get_unchecked(b as usize) };
+        if v == INVALID {
+            return None; // ambiguous base
+        }
+
+        encoded = (encoded << 2) | v as u64;
+    }
+
+    Some(encoded)
 }
 
 #[cfg(test)]
@@ -157,49 +200,65 @@ mod tests {
     use rand::Rng;
     use std::cmp::min;
 
+    // CAPACITY PRE-ALLOCATION TEST
+    
+    #[test]
+    fn test_reserve_for_ref_size() {
+        let mut processor = KmerProcessor::new(21, 1);
+
+        // For 1M bytes, we expect capacity >= 7*1M/6 ≈ 1.17M
+        processor.reserve_for_ref_size(1_000_000);
+        assert!(processor.ref_kmers.capacity() >= 1_000_000);
+
+        // For 100M bytes, capacity should scale proportionally
+        let mut processor2 = KmerProcessor::new(21, 1);
+        processor2.reserve_for_ref_size(100_000_000);
+        assert!(processor2.ref_kmers.capacity() >= 100_000_000);
+    }
+
     // KMER ENCODING TESTS
 
     #[test]
     fn test_encode_single_base() {
         // Test forward encoding
-        assert_eq!(encode_forward(b"A"), 0b00);
-        assert_eq!(encode_forward(b"C"), 0b01);
-        assert_eq!(encode_forward(b"G"), 0b10);
-        assert_eq!(encode_forward(b"T"), 0b11);
+        assert_eq!(encode_forward(b"A").unwrap(), 0b00);
+        assert_eq!(encode_forward(b"C").unwrap(), 0b01);
+        assert_eq!(encode_forward(b"G").unwrap(), 0b10);
+        assert_eq!(encode_forward(b"T").unwrap(), 0b11);
 
         // Test reverse encoding
-        assert_eq!(encode_reverse(b"A"), 0b11);
-        assert_eq!(encode_reverse(b"C"), 0b10);
-        assert_eq!(encode_reverse(b"G"), 0b01);
-        assert_eq!(encode_reverse(b"T"), 0b00);
+        assert_eq!(encode_reverse(b"A").unwrap(), 0b11);
+        assert_eq!(encode_reverse(b"C").unwrap(), 0b10);
+        assert_eq!(encode_reverse(b"G").unwrap(), 0b01);
+        assert_eq!(encode_reverse(b"T").unwrap(), 0b00);
     }
 
     #[test]
     fn test_encode_multiple_bases() {
         // Test forward encoding
         // AA = 0b0000
-        assert_eq!(encode_forward(b"AA"), 0b0000);
+        assert_eq!(encode_forward(b"AA").unwrap(), 0b0000);
         // AC = 0b0001
-        assert_eq!(encode_forward(b"AC"), 0b0001);
+        assert_eq!(encode_forward(b"AC").unwrap(), 0b0001);
         // AT = 0b0011
-        assert_eq!(encode_forward(b"AT"), 0b0011);
+        assert_eq!(encode_forward(b"AT").unwrap(), 0b0011);
         // ACGT = 0b00011011
-        assert_eq!(encode_forward(b"ACGT"), 0b00011011);
+        assert_eq!(encode_forward(b"ACGT").unwrap(), 0b00011011);
 
         // Test reverse encoding
         // AA reverse = 0b1111
-        assert_eq!(encode_reverse(b"AA"), 0b1111);
+        assert_eq!(encode_reverse(b"AA").unwrap(), 0b1111);
         // AC reverse = 0b1011
-        assert_eq!(encode_reverse(b"AC"), 0b1011);
+        assert_eq!(encode_reverse(b"AC").unwrap(), 0b1011);
         // AT reverse = 0b0011
-        assert_eq!(encode_reverse(b"AT"), 0b0011);
+        assert_eq!(encode_reverse(b"AT").unwrap(), 0b0011);
         // ACGT reverse = 0b00011011
-        assert_eq!(encode_reverse(b"ACGT"), 0b00011011);
+        assert_eq!(encode_reverse(b"ACGT").unwrap(), 0b00011011);
 
         // Test canonical behavior
         // TTA forward = 0b111100, reverse = 0b001111
-        let tta_forward = encode_forward(b"TTA");
-        let tta_reverse = encode_reverse(b"TTA");
+        let tta_forward = encode_forward(b"TTA").unwrap();
+        let tta_reverse = encode_reverse(b"TTA").unwrap();
         assert_ne!(tta_forward, tta_reverse);
         assert_eq!(min(tta_forward, tta_reverse), 0b110000);
 
@@ -209,16 +268,25 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_ambiguous_base() {
+        // Test that ambiguous bases return None
+        assert_eq!(encode_forward(b"N"), None);
+        assert_eq!(encode_forward(b"ATCGTAGCTNAGC"), None);
+        assert_eq!(encode_reverse(b"N"), None);
+        assert_eq!(encode_reverse(b"ATCGTAGCTNAGC"), None);
+    }
+
+    #[test]
     fn test_encode_longer_sequence() {
         // Test a longer sequence
         let seq = b"ACGTACGG";
 
         // Test forward encoding
-        let forward_encoded = encode_forward(seq);
+        let forward_encoded = encode_forward(seq).unwrap();
         assert!(forward_encoded > 0);
 
         // Test reverse encoding
-        let reverse_encoded = encode_reverse(seq);
+        let reverse_encoded = encode_reverse(seq).unwrap();
         assert!(reverse_encoded > 0);
 
         // Verify both are valid encodings
@@ -298,8 +366,8 @@ mod tests {
         ];
 
         for (seq, expected_forward, expected_reverse) in &test_cases {
-            assert_eq!(encode_forward(seq), *expected_forward);
-            assert_eq!(encode_reverse(seq), *expected_reverse);
+            assert_eq!(encode_forward(seq).unwrap(), *expected_forward);
+            assert_eq!(encode_reverse(seq).unwrap(), *expected_reverse);
         }
     }
 
@@ -315,8 +383,8 @@ mod tests {
         ];
 
         for seq in &test_seqs {
-            let forward = encode_forward(seq);
-            let reverse = encode_reverse(seq);
+            let forward = encode_forward(seq).unwrap();
+            let reverse = encode_reverse(seq).unwrap();
             let expected_bits = seq.len() * 2;
             let max_value = (1u64 << expected_bits) - 1;
 

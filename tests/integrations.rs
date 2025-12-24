@@ -87,6 +87,52 @@ fn test_basic_filtering_unpaired() {
 }
 
 #[test]
+fn test_filtering_ambiguous_sequences() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(
+        ref_path.to_str().unwrap(),
+        &[("ref1", "ACGTAAAAAAAAAAAAAAAAA")],
+    )
+    .unwrap();
+
+    create_fastq(
+        reads_path.to_str().unwrap(),
+        &[("read1", "ACGTNNNNNNNNNNNNNNNNN", "IIIIIIIIIIIIIIIIIIIII")],
+    )
+    .unwrap();
+
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
+        "nucleaze"
+    )))
+    .arg("--in")
+    .arg(reads_path.to_str().unwrap())
+    .arg("--ref")
+    .arg(ref_path.to_str().unwrap())
+    .arg("--outm")
+    .arg(matched_path.to_str().unwrap())
+    .arg("--outu")
+    .arg(unmatched_path.to_str().unwrap())
+    .arg("--k")
+    .arg("10")
+    .assert()
+    .success();
+
+    assert!(matched_path.exists());
+    assert!(unmatched_path.exists());
+
+    let matched_content = fs::read_to_string(&matched_path).unwrap();
+    assert!(!matched_content.contains("read1"));
+
+    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(unmatched_content.contains("read1"));
+}
+
+#[test]
 fn test_interleaved() {
     let temp = TempDir::new().unwrap();
     let ref_path = temp.path().join("ref.fa");
