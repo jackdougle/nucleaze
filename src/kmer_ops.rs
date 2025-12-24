@@ -413,7 +413,7 @@ mod tests {
         let processor = KmerProcessor::new(21, 1, true);
         assert_eq!(processor.k, 21);
         assert_eq!(processor.threshold, 1);
-        assert!(processor.ref_kmers.is_empty());
+        assert_eq!(processor.ref_kmers.iter().size_hint().0, 1); // only metadata
         assert_eq!(processor.bit_cap, (1u64 << 42) - 1);
     }
 
@@ -686,10 +686,7 @@ mod tests {
     // METADATA TESTS
     #[test]
     fn test_metadata_insertion() {
-        let mut processor = KmerProcessor::new(15, 1, true);
-        assert!(processor.ref_kmers.is_empty());
-
-        processor.process_ref(b"ACGTACGTACGTACGT");
+        let processor = KmerProcessor::new(15, 1, true);
 
         let metadata = u64::MAX ^ 15;
         assert!(processor.ref_kmers.contains(&metadata));
