@@ -79,7 +79,6 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-                    println!("Loading reference k-mers from {}", ref_path);
                     println!(
                         "Added {} from {}",
                         kmer_processor.ref_kmers.iter().size_hint().0 - 1,
@@ -147,16 +146,16 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             println!("Processing time:\t{:.3} seconds", end_time - indexing_time);
 
             println!(
-                "\nInput:\t\t\t{} reads     \t\t{} bases",
+                "\nInput:\t\t\t{} reads   \t\t{} bases",
                 read_count,
                 mbase_count + ubase_count
             );
             println!(
-                "Matches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)",
+                "Matches:\t\t{} reads ({:.2}%)   \t\t{} bases ({:.2}%)",
                 mseq_count, matched_percent, mbase_count, mbase_percent
             );
             println!(
-                "Nonmatches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)\n",
+                "Nonmatches:\t\t{} reads ({:.2}%)  \t{} bases ({:.2}%)\n",
                 useq_count, unmatched_percent, ubase_count, ubase_percent
             );
         }

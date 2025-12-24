@@ -542,61 +542,64 @@ fn test_different_k_values() {
     }
 }
 
-// #[test]
-// fn test_memory_allocation() {
-//     let temp = TempDir::new().unwrap();
-//     let ref_path = temp.path().join("ref.fa");
-//     let reads_path = temp.path().join("reads.fq");
+#[test]
+fn test_memory_allocation() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
 
-//     // Create reference with known sequences
-//     create_fasta(
-//         ref_path.to_str().unwrap(),
-//         &[("ref1", "ACGTACGTACGTACGTACGTA")],
-//     )
-//     .unwrap();
+    // Create reference with known sequences
+    create_fasta(
+        ref_path.to_str().unwrap(),
+        &[("ref1", "ACGTACGTACGTACGTACGTA")],
+    )
+    .unwrap();
 
-//     // Create reads: some match, some don't
-//     create_fastq(
-//         reads_path.to_str().unwrap(),
-//         &[
-//             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // match
-//             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // total non-match
-//             ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // partial non-match
-//         ],
-//     )
-//     .unwrap();
+    // Create reads: some match, some don't
+    create_fastq(
+        reads_path.to_str().unwrap(),
+        &[
+            ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // match
+            ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // total non-match
+            ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // partial non-match
+        ],
+    )
+    .unwrap();
 
-//     assert!(ref_path.exists());
-//     assert!(reads_path.exists());
+    assert!(ref_path.exists());
+    assert!(reads_path.exists());
 
-//     // Run nucleaze with no memory allocated
-//     Command::cargo_bin("nucleaze")
-//         .unwrap()
-//         .arg("--in")
-//         .arg(reads_path.to_str().unwrap())
-//         .arg("--ref")
-//         .arg(ref_path.to_str().unwrap())
-//         .arg("--k")
-//         .arg("21")
-//         .arg("--maxmem")
-//         .arg("1B")
-//         .assert()
-//         .failure();
+    // Run nucleaze with no memory allocated
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
+        "nucleaze"
+    )))
+    .arg("--in")
+    .arg(reads_path.to_str().unwrap())
+    .arg("--ref")
+    .arg(ref_path.to_str().unwrap())
+    .arg("--k")
+    .arg("21")
+    .arg("--maxmem")
+    .arg("1B")
+    .assert()
+    .failure();
 
-//     // Run nucleaze with enough memory allocated
-//     Command::cargo_bin("nucleaze")
-//         .unwrap()
-//         .arg("--in")
-//         .arg(reads_path.to_str().unwrap())
-//         .arg("--ref")
-//         .arg(ref_path.to_str().unwrap())
-//         .arg("--k")
-//         .arg("21")
-//         .arg("--maxmem")
-//         .arg("1G")
-//         .assert()
-//         .success();
-// }
+    // Run nucleaze with enough memory allocated
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
+        "nucleaze"
+    )))
+    .arg("--in")
+    .arg(reads_path.to_str().unwrap())
+    .arg("--ref")
+    .arg(ref_path.to_str().unwrap())
+    .arg("--k")
+    .arg("21")
+    .arg("--maxmem")
+    .arg("1G")
+    .assert()
+    .success();
+}
+
 #[test]
 fn test_duplicate_read_files() {
     let temp = TempDir::new().unwrap();
