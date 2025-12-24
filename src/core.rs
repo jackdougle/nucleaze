@@ -160,7 +160,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             );
         }
         Err(e) => {
-            eprintln!("\nError pr cessing reads:\n{}", e);
+            eprintln!("\nError processing reads:\n{}", e);
         }
     }
 
@@ -197,7 +197,8 @@ fn get_reference_kmers(
     let ref_filenames: Vec<&str> = ref_path.split(',').collect();
 
     // Pre-allocate based on total file size
-    let total_bytes: u64 = ref_filenames.iter()
+    let total_bytes: u64 = ref_filenames
+        .iter()
         .filter_map(|path| fs::metadata(path).ok())
         .map(|m| m.len())
         .sum();

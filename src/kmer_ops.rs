@@ -1,13 +1,13 @@
-use std::{cmp::min, u64};
 use rustc_hash::FxHashSet;
+use std::{cmp::min, u64};
 
 /// K-mer processor for building reference indices and filtering reads
 pub struct KmerProcessor {
-    pub k: usize,                   // k-mer size in bases
-    pub threshold: u8,              // minimum k-mer hits to consider a match
-    pub use_canonical: bool,        // whether to use canonical k-mers
-    pub ref_kmers: FxHashSet<u64>,  // set of canonical k-mers from reference
-    pub bit_cap: u64,               // bitmask for k-mer length
+    pub k: usize,                  // k-mer size in bases
+    pub threshold: u8,             // minimum k-mer hits to consider a match
+    pub use_canonical: bool,       // whether to use canonical k-mers
+    pub ref_kmers: FxHashSet<u64>, // set of canonical k-mers from reference
+    pub bit_cap: u64,              // bitmask for k-mer length
 }
 
 impl KmerProcessor {
@@ -43,15 +43,18 @@ impl KmerProcessor {
 
         let mut forward_kmer: u64 = 0b00;
         let mut reverse_kmer: u64 = 0b00;
+        let mut i: usize = 0;
 
-        for i in 0..=ref_seq.len() - self.k {
-            if i == 0 {
-                // Encode first k-mer from scratch
-                forward_kmer = match encode_forward(&ref_seq[0..self.k]) {
+        while i <= ref_seq.len() - self.k {
+            if forward_kmer == 0 {
+                forward_kmer = match encode_forward(&ref_seq[i..=i + self.k - 1]) {
                     Some(kmer) => kmer,
-                    None => continue, // skip ambiguous k-mers
+                    None => {
+                        i += 1;
+                        continue;
+                    } // skip ambiguous k-mers
                 };
-                reverse_kmer = encode_reverse(&ref_seq[0..self.k]).unwrap();
+                reverse_kmer = encode_reverse(&ref_seq[i..=i + self.k - 1]).unwrap();
             } else {
                 let new_base = match encode_forward(&[ref_seq[i + self.k - 1]]) {
                     Some(b) => b,
@@ -59,13 +62,18 @@ impl KmerProcessor {
                         // Ambiguous base, reset k-mer construction
                         forward_kmer = 0b00;
                         reverse_kmer = 0b00;
+                        i += self.k - 1; // Skip ahead ambiguous bases
                         continue;
                     }
                 };
-                forward_kmer = ((forward_kmer << 2) | new_base) & self.bit_cap; 
-                reverse_kmer = ((reverse_kmer >> 2) | (encode_reverse(&[ref_seq[i + self.k - 1]]).unwrap()
-                    << (2 * (self.k - 1)))) & self.bit_cap;
+                forward_kmer = ((forward_kmer << 2) | new_base) & self.bit_cap;
+                reverse_kmer = ((reverse_kmer >> 2)
+                    | (encode_reverse(&[ref_seq[i + self.k - 1]]).unwrap() << (2 * (self.k - 1))))
+                    & self.bit_cap;
             }
+
+            i += 1;
+
             if self.use_canonical {
                 // Store canonical k-mer (smaller of forward/RC)
                 self.ref_kmers.insert(min(forward_kmer, reverse_kmer));
@@ -89,28 +97,35 @@ impl KmerProcessor {
         let mut hits: u8 = 0;
         let mut forward_kmer = 0b00;
         let mut reverse_kmer = 0b00;
+        let mut i = 0;
 
-        for i in 0..=read_seq.len() - self.k {
+        while i <= read_seq.len() - self.k {
             if i == 0 {
-                forward_kmer = match encode_forward(&read_seq[0..self.k]) {
+                forward_kmer = match encode_forward(&read_seq[i..=i + self.k - 1]) {
                     Some(kmer) => kmer,
-                    None => continue, // skip ambiguous k-mers
-                    
+                    None => {
+                        i += 1;
+                        continue;
+                    } // skip ambiguous k-mers
                 };
-                reverse_kmer = encode_reverse(&read_seq[0..self.k]).unwrap();
+                reverse_kmer = encode_reverse(&read_seq[i..=i + self.k - 1]).unwrap();
             } else {
                 let new_base = match encode_forward(&[read_seq[i + self.k - 1]]) {
                     Some(b) => b,
                     None => {
                         forward_kmer = 0b00;
                         reverse_kmer = 0b00;
+                        i += self.k - 1;
                         continue;
                     }
                 };
                 forward_kmer = ((forward_kmer << 2) | new_base) & self.bit_cap;
-                reverse_kmer = ((reverse_kmer >> 2) | (encode_reverse(&[read_seq[i + self.k - 1]]).unwrap()
-                    << (2 * (self.k - 1)))) & self.bit_cap;
+                reverse_kmer = ((reverse_kmer >> 2)
+                    | (encode_reverse(&[read_seq[i + self.k - 1]]).unwrap() << (2 * (self.k - 1))))
+                    & self.bit_cap;
             }
+
+            i += 1;
 
             if self.use_canonical {
                 // Use canonical k-mer for comparison
@@ -212,7 +227,7 @@ mod tests {
     use std::cmp::min;
 
     // CAPACITY PRE-ALLOCATION TEST
-    
+
     #[test]
     fn test_reserve_for_ref_size() {
         let mut processor = KmerProcessor::new(21, 1, true);
