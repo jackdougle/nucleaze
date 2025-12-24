@@ -12,17 +12,21 @@ pub struct KmerProcessor {
 
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool) -> Self {
+        // Pre-fill the HashSet with metadata so the set is initialized
+        let mut ref_kmers: FxHashSet<u64> = FxHashSet::default();
+        let metadata = u64::MAX ^ k as u64;
+        ref_kmers.insert(metadata);
+
         KmerProcessor {
             k,
             threshold,
             use_canonical,
-            ref_kmers: FxHashSet::default(),
-            bit_cap: (1u64 << k * 2) - 1,
+            ref_kmers,
+            bit_cap: (1u64 << (k * 2)) - 1,
         }
     }
 
     /// Pre-allocate capacity based on expected reference size in bytes.
-    /// Assumes ~1 unique kmer per byte, targeting 75% load factor on actual slots.
     pub fn reserve_for_ref_size(&mut self, ref_bytes: usize) {
         // Target: N / actual_slots = 0.75, so actual_slots = 4N/3
         // reserve(C) allocates ~(8C/7) actual slots
@@ -35,12 +39,6 @@ impl KmerProcessor {
     pub fn process_ref(&mut self, ref_seq: &[u8]) {
         if ref_seq.len() < self.k {
             panic!("Read sequence is shorter than k");
-        }
-
-        // Insert metadata on first call to store k-mer size
-        if self.ref_kmers.is_empty() {
-            let metadata = u64::MAX ^ self.k as u64;
-            self.ref_kmers.insert(metadata);
         }
 
         let mut forward_kmer: u64 = 0b00;
@@ -78,7 +76,6 @@ impl KmerProcessor {
     }
 
     /// Check if a read has enough matching k-mers against the reference
-    /// Returns true if >= threshold k-mers are found
     pub fn process_read(&self, read_seq: &[u8]) -> bool {
         if read_seq.len() < self.k {
             println!(
@@ -105,7 +102,6 @@ impl KmerProcessor {
                 let new_base = match encode_forward(&[read_seq[i + self.k - 1]]) {
                     Some(b) => b,
                     None => {
-                        // Ambiguous base, reset k-mer construction
                         forward_kmer = 0b00;
                         reverse_kmer = 0b00;
                         continue;

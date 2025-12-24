@@ -151,7 +151,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 mbase_count + ubase_count
             );
             println!(
-                "Matches:\t\t{} reads ({:.2}%)   \t\t{} bases ({:.2}%)",
+                "Matches:\t\t{} reads ({:.2}%)   \t{} bases ({:.2}%)",
                 mseq_count, matched_percent, mbase_count, mbase_percent
             );
             println!(
