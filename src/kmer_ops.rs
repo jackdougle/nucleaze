@@ -3,17 +3,19 @@ use rustc_hash::FxHashSet;
 
 /// K-mer processor for building reference indices and filtering reads
 pub struct KmerProcessor {
-    pub k: usize,                  // k-mer size in bases
-    pub threshold: u8,             // minimum k-mer hits to consider a match
+    pub k: usize,                   // k-mer size in bases
+    pub threshold: u8,              // minimum k-mer hits to consider a match
+    pub use_canonical: bool,        // whether to use canonical k-mers
     pub ref_kmers: FxHashSet<u64>,  // set of canonical k-mers from reference
-    pub bit_cap: u64,              // bitmask for k-mer length
+    pub bit_cap: u64,               // bitmask for k-mer length
 }
 
 impl KmerProcessor {
-    pub fn new(k: usize, threshold: u8) -> Self {
+    pub fn new(k: usize, threshold: u8, use_canonical: bool) -> Self {
         KmerProcessor {
             k,
             threshold,
+            use_canonical,
             ref_kmers: FxHashSet::default(),
             bit_cap: (1u64 << k * 2) - 1,
         }
@@ -66,8 +68,12 @@ impl KmerProcessor {
                 reverse_kmer = ((reverse_kmer >> 2) | (encode_reverse(&[ref_seq[i + self.k - 1]]).unwrap()
                     << (2 * (self.k - 1)))) & self.bit_cap;
             }
-            // Store canonical k-mer (smaller of forward/RC)
-            self.ref_kmers.insert(min(forward_kmer, reverse_kmer));
+            if self.use_canonical {
+                // Store canonical k-mer (smaller of forward/RC)
+                self.ref_kmers.insert(min(forward_kmer, reverse_kmer));
+                continue;
+            }
+            self.ref_kmers.insert(forward_kmer);
         }
     }
 
@@ -110,9 +116,18 @@ impl KmerProcessor {
                     << (2 * (self.k - 1)))) & self.bit_cap;
             }
 
-            let canonical = min(forward_kmer, reverse_kmer);
+            if self.use_canonical {
+                // Use canonical k-mer for comparison
+                if self.ref_kmers.contains(&min(forward_kmer, reverse_kmer)) {
+                    hits += 1;
+                    if hits >= self.threshold {
+                        return true; // early exit once threshold met
+                    }
+                }
+                continue;
+            }
 
-            if self.ref_kmers.contains(&canonical) {
+            if self.ref_kmers.contains(&forward_kmer) {
                 hits += 1;
                 if hits >= self.threshold {
                     return true; // early exit once threshold met
@@ -204,14 +219,14 @@ mod tests {
     
     #[test]
     fn test_reserve_for_ref_size() {
-        let mut processor = KmerProcessor::new(21, 1);
+        let mut processor = KmerProcessor::new(21, 1, true);
 
         // For 1M bytes, we expect capacity >= 7*1M/6 ≈ 1.17M
         processor.reserve_for_ref_size(1_000_000);
         assert!(processor.ref_kmers.capacity() >= 1_000_000);
 
         // For 100M bytes, capacity should scale proportionally
-        let mut processor2 = KmerProcessor::new(21, 1);
+        let mut processor2 = KmerProcessor::new(21, 1, true);
         processor2.reserve_for_ref_size(100_000_000);
         assert!(processor2.ref_kmers.capacity() >= 100_000_000);
     }
@@ -399,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_kmer_processor_normal_vars() {
-        let processor = KmerProcessor::new(21, 1);
+        let processor = KmerProcessor::new(21, 1, true);
         assert_eq!(processor.k, 21);
         assert_eq!(processor.threshold, 1);
         assert!(processor.ref_kmers.is_empty());
@@ -408,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_kmer_processor_diff_vars() {
-        let processor = KmerProcessor::new(15, 3);
+        let processor = KmerProcessor::new(15, 3, true);
         assert_eq!(processor.k, 15);
         assert_eq!(processor.threshold, 3);
         assert_eq!(processor.bit_cap, (1u64 << 30) - 1);
@@ -418,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_single_sequence() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         let ref_seq = b"ACGTACGT";
 
         processor.process_ref(ref_seq);
@@ -433,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_process_multiple() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
 
         processor.process_ref(b"ACGTACGT");
         let count1 = processor.ref_kmers.len();
@@ -448,13 +463,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "Read sequence is shorter than k")]
     fn test_process_short() {
-        let mut processor = KmerProcessor::new(10, 1);
+        let mut processor = KmerProcessor::new(10, 1, true);
         processor.process_ref(b"ACGT"); // Only 4 bases, k=10
     }
 
     #[test]
     fn test_rc_refs() {
-        let mut processor = KmerProcessor::new(3, 1);
+        let mut processor = KmerProcessor::new(3, 1, true);
         processor.process_ref(b"TTTT"); // original
         processor.process_ref(b"AAAA"); // rc 
 
@@ -465,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_process_read_exact_match() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         let ref_seq = b"ACGTACGT";
         processor.process_ref(ref_seq);
 
@@ -476,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_process_read_no_match() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         processor.process_ref(b"ACGTACGT");
 
         // Completely different sequence
@@ -486,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_process_read_partial_match_below_threshold() {
-        let mut processor = KmerProcessor::new(5, 3);
+        let mut processor = KmerProcessor::new(5, 3, true);
         processor.process_ref(b"ACGTACGT");
 
         // This read should have some matches but not reach threshold of 3
@@ -499,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_process_read_meets_threshold() {
-        let mut processor = KmerProcessor::new(4, 1);
+        let mut processor = KmerProcessor::new(4, 1, true);
         processor.process_ref(b"ACGTACGT");
 
         // Read with at least one matching k-mer
@@ -509,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_process_read_too_short() {
-        let processor = KmerProcessor::new(10, 1);
+        let processor = KmerProcessor::new(10, 1, true);
         let read = b"ACGT"; // Only 4 bases, k=10
 
         assert!(!processor.process_read(read));
@@ -519,13 +534,13 @@ mod tests {
 
     #[test]
     fn test_bit_cap_calculation() {
-        let processor5 = KmerProcessor::new(5, 1);
+        let processor5 = KmerProcessor::new(5, 1, true);
         assert_eq!(processor5.bit_cap, (1u64 << 10) - 1);
 
-        let processor10 = KmerProcessor::new(10, 1);
+        let processor10 = KmerProcessor::new(10, 1, true);
         assert_eq!(processor10.bit_cap, (1u64 << 20) - 1);
 
-        let processor21 = KmerProcessor::new(21, 1);
+        let processor21 = KmerProcessor::new(21, 1, true);
         assert_eq!(processor21.bit_cap, (1u64 << 42) - 1);
     }
 
@@ -533,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_kmer_generation() {
-        let mut processor = KmerProcessor::new(3, 1);
+        let mut processor = KmerProcessor::new(3, 1, true);
 
         // For sequence "ACGTACGT" with k=3:
         // k-mers should be: ACG, CGT, GTA, TAC, ACG, CGA
@@ -548,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_kmers() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
 
         // Process same sequence twice
         processor.process_ref(b"ACGTACGT");
@@ -565,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_threshold_one() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         processor.process_ref(b"ACGTACGTACGT");
 
         // Even one matching k-mer should return true
@@ -575,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_threshold_higher() {
-        let mut processor = KmerProcessor::new(3, 3);
+        let mut processor = KmerProcessor::new(3, 3, true);
         processor.process_ref(b"ACGTACGT");
 
         // Need at least 3 matching k-mers
@@ -587,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_minimum_k_value() {
-        let mut processor = KmerProcessor::new(1, 1);
+        let mut processor = KmerProcessor::new(1, 1, true);
         processor.process_ref(b"ACGT");
 
         let read = b"AAAA";
@@ -596,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_sequence_exactly_k_length() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         let seq = b"ACGTA"; // Exactly k=5
 
         processor.process_ref(seq);
@@ -605,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_empty_reference_set() {
-        let processor = KmerProcessor::new(5, 1);
+        let processor = KmerProcessor::new(5, 1, true);
         let read = b"ACGTACGT";
 
         // No reference k-mers added
@@ -614,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_repeated_bases() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
         processor.process_ref(b"AAAAAAAAAA");
 
         let read = b"AAAAAAAAAA";
@@ -625,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_canonical() {
-        let mut processor = KmerProcessor::new(5, 1);
+        let mut processor = KmerProcessor::new(5, 1, true);
 
         // Add forward strand
         processor.process_ref(b"ATGCCAGT");
@@ -639,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_large_reference_set() {
-        let mut processor = KmerProcessor::new(21, 1);
+        let mut processor = KmerProcessor::new(21, 1, true);
         let bases = ["A", "C", "G", "T"];
 
         // Add many reference sequences
@@ -654,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_long_sequence_processing() {
-        let mut processor = KmerProcessor::new(21, 1);
+        let mut processor = KmerProcessor::new(21, 1, true);
         let mut randy = rand::rng();
         // Create a long sequence (1000 bases)
         let long_seq: Vec<u8> = (0..1000)
@@ -675,7 +690,7 @@ mod tests {
     // METADATA TESTS
     #[test]
     fn test_metadata_insertion() {
-        let mut processor = KmerProcessor::new(15, 1);
+        let mut processor = KmerProcessor::new(15, 1, true);
         assert!(processor.ref_kmers.is_empty());
 
         processor.process_ref(b"ACGTACGTACGTACGT");
@@ -686,8 +701,8 @@ mod tests {
 
     #[test]
     fn test_metadata_different_k() {
-        let mut processor21 = KmerProcessor::new(21, 1);
-        let mut processor15 = KmerProcessor::new(15, 1);
+        let mut processor21 = KmerProcessor::new(21, 1, true);
+        let mut processor15 = KmerProcessor::new(15, 1, true);
 
         processor21.process_ref(b"ACGTACGTACGTACGTACGTACGT");
         processor15.process_ref(b"ACGTACGTACGTACGT");
@@ -704,7 +719,7 @@ mod tests {
     #[test]
     fn test_various_thresholds() {
         for threshold in 1..=5 {
-            let mut processor = KmerProcessor::new(5, threshold);
+            let mut processor = KmerProcessor::new(5, threshold, true);
             processor.process_ref(b"ACGTACGTACGTACGT");
 
             let read = b"ACGTACGTACGTACGT";
@@ -717,7 +732,7 @@ mod tests {
     #[test]
     fn test_multiple_k() {
         for k in [3, 5, 7, 11, 15, 21, 25, 31].iter() {
-            let mut processor = KmerProcessor::new(*k, 1);
+            let mut processor = KmerProcessor::new(*k, 1, true);
 
             // Create sequence long enough for this k
             let seq: Vec<u8> = (0..*k + 10)
@@ -737,7 +752,7 @@ mod tests {
     // BOUNDARY TESTS
     #[test]
     fn test_sequence_length_k() {
-        let mut processor = KmerProcessor::new(10, 1);
+        let mut processor = KmerProcessor::new(10, 1, true);
         let seq = b"ACGTACGTAC"; // Exactly 10 bases
 
         processor.process_ref(seq);
@@ -747,11 +762,46 @@ mod tests {
 
     #[test]
     fn test_sequence_length_k_plus_one() {
-        let mut processor = KmerProcessor::new(10, 1);
+        let mut processor = KmerProcessor::new(10, 1, true);
         let seq = b"ACGTACGTACT"; // 11 bases
 
         processor.process_ref(seq);
         // Should have metadata + 2 k-mers
         assert_eq!(processor.ref_kmers.len(), 3);
+    }
+
+    // NON-CANONICAL BEHAVIOR UNIT TESTS
+
+    #[test]
+    fn test_noncanonical_ref_and_read_no_match() {
+        // Reference is all T's, read is all A's; without canonicalization they should not match
+        let mut processor = KmerProcessor::new(5, 1, false);
+        processor.process_ref(b"TTTTTTTT");
+
+        // Read of A's should not match when canonical is disabled
+        let read = b"AAAAAAAA";
+        assert!(!processor.process_read(read));
+    }
+
+    #[test]
+    fn test_noncanonical_ref_stores_forward_kmers() {
+        let mut processor = KmerProcessor::new(4, 1, false);
+        processor.process_ref(b"TTTT");
+
+        // Forward encoding of TTTT should be present in the set
+        let kmer = encode_forward(b"TTTT").unwrap();
+        assert!(processor.ref_kmers.contains(&kmer));
+    }
+
+    #[test]
+    fn test_canonical_vs_noncanonical_difference() {
+        // Demonstrate that canonical=true will match RC but canonical=false will not
+        let mut noncanon = KmerProcessor::new(5, 1, false);
+        noncanon.process_ref(b"TTTTT");
+        assert!(!noncanon.process_read(b"AAAAA"));
+
+        let mut canon = KmerProcessor::new(5, 1, true);
+        canon.process_ref(b"TTTTT");
+        assert!(canon.process_read(b"AAAAA"));
     }
 }

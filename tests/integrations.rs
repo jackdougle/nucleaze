@@ -791,3 +791,82 @@ fn test_threads_argument() {
     .assert()
     .success();
 }
+
+#[test]
+fn test_integration_no_canonical_flag() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref_no_c.fa");
+    let reads_path = temp.path().join("reads_no_c.fq");
+    let matched_path = temp.path().join("matched_no_c.fq");
+    let unmatched_path = temp.path().join("unmatched_no_c.fq");
+
+    // Reference: all T's
+    create_fasta(ref_path.to_str().unwrap(), &[("ref1", "TTTTTTTTTT")]).unwrap();
+
+    // Read: all A's (should not match without canonical flag)
+    create_fastq(
+        reads_path.to_str().unwrap(),
+        &[("read1", "AAAAAAAAAA", "IIIIIIIIII")],
+    )
+    .unwrap();
+
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!("nucleaze")))
+        .arg("--in")
+        .arg(reads_path.to_str().unwrap())
+        .arg("--ref")
+        .arg(ref_path.to_str().unwrap())
+        .arg("--outm")
+        .arg(matched_path.to_str().unwrap())
+        .arg("--outu")
+        .arg(unmatched_path.to_str().unwrap())
+        .arg("--k")
+        .arg("5")
+        .assert()
+        .success();
+
+    let matched_content = fs::read_to_string(&matched_path).unwrap();
+    assert!(matched_content.trim().is_empty(), "expected no matched reads in non-canonical mode");
+
+    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(unmatched_content.contains("AAAAAAAAAA"));
+}
+
+#[test]
+fn test_integration_with_canonical_flag() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref_c.fa");
+    let reads_path = temp.path().join("reads_c.fq");
+    let matched_path = temp.path().join("matched_c.fq");
+    let unmatched_path = temp.path().join("unmatched_c.fq");
+
+    // Reference: all T's
+    create_fasta(ref_path.to_str().unwrap(), &[("ref1", "TTTTTTTTTT")]).unwrap();
+
+    // Read: all A's (should match when canonical flag enabled)
+    create_fastq(
+        reads_path.to_str().unwrap(),
+        &[("read1", "AAAAAAAAAA", "IIIIIIIIII")],
+    )
+    .unwrap();
+
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!("nucleaze")))
+        .arg("--in")
+        .arg(reads_path.to_str().unwrap())
+        .arg("--ref")
+        .arg(ref_path.to_str().unwrap())
+        .arg("--outm")
+        .arg(matched_path.to_str().unwrap())
+        .arg("--outu")
+        .arg(unmatched_path.to_str().unwrap())
+        .arg("--k")
+        .arg("5")
+        .arg("--canonical")
+        .assert()
+        .success();
+
+    let matched_content = fs::read_to_string(&matched_path).unwrap();
+    assert!(matched_content.contains("AAAAAAAAAA"));
+
+    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(unmatched_content.trim().is_empty());
+}

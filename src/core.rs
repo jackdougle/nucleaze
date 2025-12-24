@@ -50,6 +50,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let k = args.k.unwrap_or(21);
     let min_hits = args.minhits.unwrap_or(1);
     let ordered_output = args.order;
+    let use_canonical = args.canonical;
 
     let ref_path = args.r#ref.unwrap_or_default();
     let bin_kmers_path = &args.binref.unwrap_or_default();
@@ -62,7 +63,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
-    let mut kmer_processor = KmerProcessor::new(k, min_hits);
+    let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical);
 
     // Try loading pre-built k-mer index, otherwise build from scratch
     match load_serialized_kmers(bin_kmers_path, &mut kmer_processor) {
@@ -146,7 +147,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             println!("Processing time:\t{:.3} seconds", end_time - indexing_time);
 
             println!(
-                "\nInput:\t\t\t{} reads\t\t{} bases",
+                "\nInput:\t\t\t{} reads     \t\t{} bases",
                 read_count,
                 mbase_count + ubase_count
             );
