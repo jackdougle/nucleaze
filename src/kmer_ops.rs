@@ -100,10 +100,12 @@ impl KmerProcessor {
         let mut i = 0;
 
         while i <= read_seq.len() - self.k {
-            if i == 0 {
+            if forward_kmer == 0 {
                 forward_kmer = match encode_forward(&read_seq[i..=i + self.k - 1]) {
                     Some(kmer) => kmer,
                     None => {
+                        forward_kmer = 0b00;
+                        reverse_kmer = 0b00;
                         i += 1;
                         continue;
                     } // skip ambiguous k-mers
