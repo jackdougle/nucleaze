@@ -28,7 +28,7 @@ impl KmerProcessor {
 
     /// Pre-allocate capacity based on expected reference size in bytes.
     pub fn reserve_for_ref_size(&mut self, ref_bytes: usize) {
-        let capacity = ref_bytes * 9; // 1.17x expected kmers
+        let capacity = ref_bytes * 7 / 6; // 1.17x expected kmers
         self.ref_kmers.reserve(capacity);
     }
 
