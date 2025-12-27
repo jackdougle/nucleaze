@@ -42,13 +42,14 @@ impl PartialOrd for SequenceChunk {
 /// Main entry point for processing reads against a reference k-mer index
 pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let available_threads = num_cpus::get();
-
     let num_threads = args
         .threads
         .unwrap_or(available_threads)
         .min(available_threads);
+
     let k = args.k.unwrap_or(21);
     let min_hits = args.minhits.unwrap_or(1);
+
     let ordered_output = args.order;
     let use_canonical = args.canonical;
 
@@ -56,11 +57,10 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let bin_kmers_path = &args.binref.unwrap_or_default();
     if ref_path.is_empty() && bin_kmers_path.is_empty() {
         eprintln!(
-            "Error: Please provide either a reference file (--ref) or a binary k-mer index file (--binref)."
+            "Error: Please provide either a reference file (--ref) or a serialized k-mer index file (--binref)."
         );
         std::process::exit(1);
     }
-
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
     let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical);
@@ -182,7 +182,7 @@ fn load_serialized_kmers(
     if !processor.ref_kmers.contains(&size_metadata) {
         processor.ref_kmers.clear();
         return Err(
-            format!("k-mers are of different length than specified k (default k = 21)").into(),
+            format!("k-mers are of different length than specified k ({})", processor.k).into(),
         );
     }
 
@@ -304,11 +304,13 @@ fn process_reads(
 
     let chunk_idx = Arc::new(AtomicU32::new(0));
 
-    // Extract file extensions and detect stdout usage
+    // Extract file extensions
     let matched_filetype = matched_path.rsplit('.').next().unwrap_or("").to_string();
     let unmatched_filetype = unmatched_path.rsplit('.').next().unwrap_or("").to_string();
     let matched2_filetype = matched2_path.rsplit('.').next().unwrap_or("").to_string();
     let unmatched2_filetype = unmatched2_path.rsplit('.').next().unwrap_or("").to_string();
+
+    // Check if output is to stdout
     let matched_stdout = matched_path == "stdout" || matched_path.starts_with("stdout.");
     let unmatched_stdout = unmatched_path == "stdout" || unmatched_path.starts_with("stdout.");
     let matched2_stdout = matched2_path == "stdout" || matched2_path.starts_with("stdout.");
@@ -476,7 +478,7 @@ fn process_reads(
     let unmatched_bases = Arc::new(AtomicU32::new(0));
 
     // Write a SequenceChunk to disk, reconstructing reads from the arena
-    let mut write_chunk_logic =
+    let mut chunk_output =
         |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
             let arena = &chunk.data_arena;
             let offsets = &chunk.offsets;
@@ -612,14 +614,14 @@ fn process_reads(
         for chunk in chunk_receiver {
             if chunk.id == next_chunk_id {
                 // Chunk arrived in order
-                write_chunk_logic(&chunk)?;
+                chunk_output(&chunk)?;
                 next_chunk_id += 1;
 
                 // Check if subsequent chunks are already buffered
                 while let Some(buffered) = out_of_order_buffer.peek() {
                     if buffered.id == next_chunk_id {
                         let buffered = out_of_order_buffer.pop().unwrap();
-                        write_chunk_logic(&buffered)?;
+                        chunk_output(&buffered)?;
                         next_chunk_id += 1;
                     } else {
                         break;
@@ -636,7 +638,7 @@ fn process_reads(
         // Drain remaining buffered chunks
         while let Some(buffered) = out_of_order_buffer.pop() {
             if buffered.id == next_chunk_id {
-                write_chunk_logic(&buffered)?;
+                chunk_output(&buffered)?;
                 next_chunk_id += 1;
             } else {
                 return Err(Box::from("Missing chunk in ordered output stream."));
@@ -645,7 +647,7 @@ fn process_reads(
     } else {
         // Unordered mode: write chunks as they arrive
         for chunk in chunk_receiver {
-            write_chunk_logic(&chunk)?;
+            chunk_output(&chunk)?;
         }
     }
 
@@ -691,14 +693,14 @@ fn write_read(
 ) -> Result<(), Box<dyn Send + Sync + Error>> {
     if stdout {
         unsafe {
-            let s_id = std::str::from_utf8_unchecked(id);
-            let s_seq = std::str::from_utf8_unchecked(sequence);
+            let id = std::str::from_utf8_unchecked(id);
+            let seq = std::str::from_utf8_unchecked(sequence);
 
             if format == "fa" || format == "fna" || format == "fasta" {
-                println!(">\n{}\n{}", s_id, s_seq);
+                println!(">{}\n{}", id, seq);
             } else {
-                let s_qual = std::str::from_utf8_unchecked(quality);
-                println!("@\n{}\n{}\n+\n{}", s_id, s_seq, s_qual);
+                let qual = std::str::from_utf8_unchecked(quality);
+                println!("@{}\n{}\n+\n{}", id, seq, qual);
             }
         }
     } else {
@@ -718,5 +720,6 @@ fn write_read(
             writer.write_all(b"\n")?;
         }
     }
+
     Ok(())
 }

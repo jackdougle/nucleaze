@@ -28,10 +28,7 @@ impl KmerProcessor {
 
     /// Pre-allocate capacity based on expected reference size in bytes.
     pub fn reserve_for_ref_size(&mut self, ref_bytes: usize) {
-        // Target: N / actual_slots = 0.75, so actual_slots = 4N/3
-        // reserve(C) allocates ~(8C/7) actual slots
-        // Solve: 8C/7 = 4N/3 → C = 7N/6
-        let capacity = ref_bytes * 7 / 6;
+        let capacity = ref_bytes * 9; // 1.17x expected kmers
         self.ref_kmers.reserve(capacity);
     }
 
