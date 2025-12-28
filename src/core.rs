@@ -12,18 +12,18 @@ use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use crossbeam::channel::{bounded, Sender, Receiver as XReceiver};
 use std::time::Instant;
 use std::{fs, io, u32};
 use std::{thread, usize};
 
 /// A chunk of sequences with their match results
-/// Stored as a single arena to minimize allocations
 #[derive(Eq, PartialEq)]
 struct SequenceChunk {
     id: u32,
-    data_arena: Vec<u8>,                          // raw bytes for all sequences
-    offsets: Vec<(u32, u32, u32, u32, u32, u32)>, // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
-    matches: Vec<bool>,                           // k-mer match results
+    data_arena: Vec<u8>,                            // raw bytes for all sequences
+    offsets: Vec<(u32, u32, u32, u32, u32, u32)>,   // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
+    matches: Vec<bool>,                             // k-mer match results
 }
 
 // Implement Ord for BinaryHeap to support ordered output
@@ -39,13 +39,18 @@ impl PartialOrd for SequenceChunk {
     }
 }
 
-/// Main entry point for processing reads against a reference k-mer index
+/// Processing reads against a reference k-mer index 
 pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let available_threads = num_cpus::get();
     let num_threads = args
         .threads
         .unwrap_or(available_threads)
         .min(available_threads);
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .expect("Could not build Rayon Pool with specified thread amount");
 
     let k = args.k.unwrap_or(21);
     let min_hits = args.minhits.unwrap_or(1);
@@ -68,9 +73,10 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     // Try loading pre-built k-mer index, otherwise build from scratch
     match load_serialized_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
+            let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|vec| vec.len()).sum();
             println!(
                 "\nLoaded {} k-mers from {}",
-                kmer_processor.ref_kmers.iter().size_hint().0 - 1,
+                total_kmers,
                 bin_kmers_path
             )
         }
@@ -79,9 +85,11 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
+                    let total_kmers: usize = kmer_processor.ref_kmers.iter()
+                    .map(|v| v.len()).sum();
                     println!(
                         "Added {} from {}",
-                        kmer_processor.ref_kmers.iter().size_hint().0 - 1,
+                        total_kmers,
                         ref_path,
                     );
                 }
@@ -100,11 +108,6 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 
     let indexing_time = start_time.elapsed().as_secs_f32();
     println!("Indexing time:\t\t{:.3} seconds\n", indexing_time);
-
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .expect("Could not build Rayon Pool with specified thread amount");
 
     let process_mode = detect_mode(&args.in2, &args.outm2, &args.outu2, args.interinput);
 
@@ -179,7 +182,7 @@ fn load_serialized_kmers(
 
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
-    if !processor.ref_kmers.contains(&size_metadata) {
+    if !processor.ref_kmers.contains(&Vec::from([size_metadata])) {
         processor.ref_kmers.clear();
         return Err(
             format!("k-mers are of different length than specified k ({})", processor.k).into(),
@@ -194,27 +197,55 @@ fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
-    let ref_filenames: Vec<&str> = ref_path.split(',').collect();
+    const KMER_ID_LENGTH: usize = 12;                 
+    const KMER_PARTITIONS: usize = 1 << KMER_ID_LENGTH; // 4096 shards
 
-    // Pre-allocate based on total file size
-    let total_bytes: u64 = ref_filenames
-        .iter()
-        .filter_map(|path| fs::metadata(path).ok())
-        .map(|m| m.len())
-        .sum();
-    processor.reserve_for_ref_size(total_bytes as usize);
+    let (sender, receiver) = bounded::<Vec<u8>>(8);
 
-    for ref_path in ref_filenames {
-        println!("Loading reference k-mers from {}", ref_path);
-        let mut reader = parse_fastx_file(ref_path)?;
+    spawn_reader(ref_path, sender);
 
-        while let Some(record) = reader.next() {
-            let record = record?;
-            processor.process_ref(&record.seq());
+    let num_worker_threads = num_cpus::get_physical();
+    let kmer_index: Vec<Vec<Vec<u64>>> = (0..num_worker_threads).into_par_iter()
+        .map(|_| spawn_worker(receiver.clone(), processor.clone())).collect();
+
+    eprintln!("Extraction complete. Merging thread kmer indices...");
+
+    processor.ref_kmers = (0..KMER_PARTITIONS)
+    .into_par_iter()
+    .map(|kmer_id| {
+        let mut merged = Vec::new();
+        for thread_kmer_index in &kmer_index {
+            merged.extend_from_slice(&thread_kmer_index[kmer_id]);
         }
-    }
+        merged.sort_unstable();
+        merged.dedup();
+        merged
+    }).collect();
 
     Ok(())
+}
+
+fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
+    let path = path.to_string();
+
+    std::thread::spawn(move || {
+        let mut reader = parse_fastx_file(&path).expect("FASTA open failed");
+
+        while let Some(record) = reader.next() {
+            let seqrec = record.expect("FASTA parse error");
+            sender.send(seqrec.seq().to_vec()).unwrap();
+        }
+    });
+}
+
+fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<Vec<u64>> {
+    let mut ref_kmer_index = vec![Vec::<u64>::new(); 4096];
+
+    while let Ok(seq) = receiver.recv() {
+        processor.process_ref(&seq, &mut ref_kmer_index);
+    }
+
+    ref_kmer_index
 }
 
 /// Save k-mer index to binary file for faster loading later
@@ -228,14 +259,14 @@ fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<
     Ok(())
 }
 
-#[derive(PartialEq, Clone, Copy, Debug, Default)]
+#[derive(PartialEq, Clone, Copy, Default)]
 enum ProcessMode {
     #[default]
-    Unpaired, // single-end reads
-    Paired,           // paired-end in two files, output to two files
-    PairedInInterOut, // paired-end in two files, interleaved output
-    InterInPairedOut, // interleaved input, paired-end output
-    Interleaved,      // interleaved input and output
+    Unpaired,           // single-end reads
+    Paired,             // paired-end in two files, output to two files
+    PairedInInterOut,   // paired-end in two files, interleaved output
+    InterInPairedOut,   // interleaved input, paired-end output
+    Interleaved,        // interleaved input and output
 }
 
 /// Determine input/output mode based on file arguments
