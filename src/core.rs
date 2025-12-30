@@ -4,7 +4,6 @@ use crate::kmer_ops::KmerProcessor;
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
-use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
@@ -181,7 +180,7 @@ fn load_serialized_kmers(
 
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
-    if !processor.ref_kmers[0].contains(&size_metadata) {
+    if !processor.ref_kmers[0].binary_search(&size_metadata).is_ok() {
         processor.ref_kmers.clear();
         return Err(
             format!("k-mers are of different length than specified k ({})", processor.k).into(),
@@ -204,7 +203,7 @@ fn get_reference_kmers(
     spawn_reader(ref_path, sender);
 
     let num_worker_threads = num_cpus::get_physical();
-    let kmer_index: Vec<Vec<FxHashSet<u64>>> = (0..num_worker_threads).into_par_iter()
+    let kmer_index: Vec<Vec<Vec<u64>>> = (0..num_worker_threads).into_par_iter()
         .map(|_| spawn_worker(receiver.clone(), processor.clone())).collect();
 
     eprintln!("Extraction complete. Merging thread kmer indices...");
@@ -212,10 +211,12 @@ fn get_reference_kmers(
     processor.ref_kmers = (0..KMER_PARTITIONS)
     .into_par_iter()
     .map(|kmer_id| {
-        let mut merged = FxHashSet::default();
+        let mut merged = Vec::new();
         for thread_kmer_index in &kmer_index {
-            merged.extend(&thread_kmer_index[kmer_id]);
+            merged.extend_from_slice(&thread_kmer_index[kmer_id]);
         }
+        merged.sort_unstable();
+        merged.dedup();
         merged
     }).collect();
 
@@ -235,8 +236,8 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
     });
 }
 
-fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<std::collections::HashSet<u64, FxBuildHasher>> {
-    let mut ref_kmer_index = vec![FxHashSet::<u64>::default(); 4096];
+fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<Vec<u64>> {
+    let mut ref_kmer_index = vec![Vec::<u64>::new(); 4096];
 
     while let Ok(seq) = receiver.recv() {
         processor.process_ref(&seq, &mut ref_kmer_index);
