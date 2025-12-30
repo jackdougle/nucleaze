@@ -1,14 +1,15 @@
 use std::cmp::min;
+use rustc_hash::FxHashSet;
 
 /// K-mer processor for building reference indices and filtering reads
 #[derive(Clone)]
 pub struct KmerProcessor {
     pub k: usize,                   
-    pub threshold: u8,              
-    pub use_canonical: bool,        
-    pub ref_kmers: Vec<Vec<u64>>,   
-    pub bit_cap: u64,               
-    pub kmer_id_length: usize,      
+    pub threshold: u8,        
+    pub use_canonical: bool,
+    pub ref_kmers: Vec<FxHashSet<u64>>,
+    pub bit_cap: u64,
+    pub kmer_id_length: usize,
 }
 
 impl KmerProcessor {
@@ -16,11 +17,11 @@ impl KmerProcessor {
         // Initialize with empty vectors to avoid index out of bounds during parallel build
         let kmer_id_length = 12;
         let num_partitions = 1 << kmer_id_length;
-        let mut ref_kmers = vec![Vec::new(); num_partitions];
+        let mut ref_kmers = vec![FxHashSet::default(); num_partitions];
         
         // Store metadata in the first bucket (optional, kept for compatibility)
         let metadata = u64::MAX ^ k as u64;
-        ref_kmers[0].push(metadata);
+        ref_kmers[0].insert(metadata);
 
         KmerProcessor {
             k,
@@ -34,7 +35,7 @@ impl KmerProcessor {
     }
 
     /// Build reference k-mer index from a sequence
-    pub fn process_ref(&self, seq: &[u8], kmer_index: &mut Vec<Vec<u64>>) {
+    pub fn process_ref(&self, seq: &[u8], kmer_index: &mut Vec<FxHashSet<u64>>) {
         let mut kmer = 0u64;
         let mut valid_bases = 0usize;
 
@@ -52,7 +53,7 @@ impl KmerProcessor {
                     
                     let sid = self.map_kmer(&kmer_to_store);
                     // Just push; sorting happens during merge phase
-                    kmer_index[sid].push(kmer_to_store);
+                    kmer_index[sid].insert(kmer_to_store);
                 }
             } else {
                 kmer = 0;
@@ -113,7 +114,7 @@ impl KmerProcessor {
     #[inline(always)]
     fn contains_kmer(&self, kmer: &u64) -> bool {
         let kmer_id = self.map_kmer(kmer);
-        self.ref_kmers[kmer_id].binary_search(kmer).is_ok()
+        self.ref_kmers[kmer_id].contains(kmer)
     }
 
     #[inline(always)]
