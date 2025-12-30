@@ -14,7 +14,6 @@ pub struct KmerProcessor {
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool) -> Self {
         // Initialize with empty vectors to avoid index out of bounds during parallel build
-        // We use 4096 partitions (12 bits)
         let kmer_id_length = 12;
         let num_partitions = 1 << kmer_id_length;
         let mut ref_kmers = vec![Vec::new(); num_partitions];
@@ -37,14 +36,14 @@ impl KmerProcessor {
     /// Build reference k-mer index from a sequence
     pub fn process_ref(&self, seq: &[u8], kmer_index: &mut Vec<Vec<u64>>) {
         let mut kmer = 0u64;
-        let mut valid = 0usize;
+        let mut valid_bases = 0usize;
 
         for &base in seq {
             if let Some(bits) = encode(base) {
                 kmer = ((kmer << 2) | bits) & self.bit_cap;
-                valid += 1;
+                valid_bases += 1;
 
-                if valid >= self.k {
+                if valid_bases >= self.k {
                     let kmer_to_store = if self.use_canonical {
                         needletail::bitkmer::canonical((kmer, 0)).0.0
                     } else {
@@ -57,7 +56,7 @@ impl KmerProcessor {
                 }
             } else {
                 kmer = 0;
-                valid = 0;
+                valid_bases = 0;
             }
         }
     }
@@ -69,34 +68,30 @@ impl KmerProcessor {
         }
 
         let mut hits: u8 = 0;
-        let mut forward_kmer = 0u64;
-        let mut reverse_kmer = 0u64;
+        let mut kmer = 0u64;
+        let mut rc_kmer = 0u64;
         let mut valid_bases = 0;
 
-        // Optimized sliding window
-        // We iterate positions. If we hit an ambiguous base, we reset.
-        // This avoids calling encode_forward/reverse repeatedly which is slow.
-        
         for &base in seq {
             match encode(base) {
                 Some(encoded_base) => {
-                    forward_kmer = ((forward_kmer << 2) | encoded_base) & self.bit_cap;
+                    kmer = ((kmer << 2) | encoded_base) & self.bit_cap;
                     
-                    // Update reverse kmer: (reverse >> 2) | (complement << shift)
+                    // Update rc kmer: (rc >> 2) | (complement << shift)
                     let encoded_rc_base = encoded_base ^ 0b11; // Inverse of bits (A=00->T=11)
-                    reverse_kmer = (reverse_kmer >> 2) | (encoded_rc_base << (2 * (self.k - 1)));
+                    rc_kmer = (rc_kmer >> 2) | (encoded_rc_base << (2 * (self.k - 1)));
                     
                     valid_bases += 1;
 
                     if valid_bases >= self.k {
-                        let match_found = if self.use_canonical {
-                            let canonical_kmer = min(forward_kmer, reverse_kmer);
+                        let is_hit = if self.use_canonical {
+                            let canonical_kmer = min(kmer, rc_kmer);
                             self.contains_kmer(&canonical_kmer)
                         } else {
-                            self.contains_kmer(&forward_kmer)
+                            self.contains_kmer(&kmer)
                         };
 
-                        if match_found {
+                        if is_hit {
                             hits += 1;
                             if hits >= self.threshold {
                                 return true;
@@ -106,8 +101,8 @@ impl KmerProcessor {
                 }
                 None => {
                     valid_bases = 0;
-                    forward_kmer = 0;
-                    reverse_kmer = 0;
+                    kmer = 0;
+                    rc_kmer = 0;
                 }
             }
         }

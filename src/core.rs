@@ -182,7 +182,7 @@ fn load_serialized_kmers(
 
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
-    if !processor.ref_kmers.contains(&Vec::from([size_metadata])) {
+    if !processor.ref_kmers[0].binary_search(&size_metadata).is_ok() {
         processor.ref_kmers.clear();
         return Err(
             format!("k-mers are of different length than specified k ({})", processor.k).into(),
