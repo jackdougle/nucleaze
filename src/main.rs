@@ -132,6 +132,10 @@ struct Args {
     /// Enabling flag uses canonical k-mers for comparison
     #[arg(short, long)]
     canonical: bool,
+
+    /// Size of Bloom filter in human readable format
+    #[arg(short, long)]
+    bloomsize: Option<String>,
 }
 
 fn main() -> io::Result<()> {

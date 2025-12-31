@@ -1,7 +1,8 @@
 //! I/O and processing operations for filtering read sequences based on kmer similarity
 
-use crate::kmer_ops::KmerProcessor;
+use crate::{kmer_ops::KmerProcessor, parse_memory_size};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
+use crossbeam::channel::{Receiver as XReceiver, Sender, bounded};
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -12,7 +13,6 @@ use std::io::{BufReader, BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use crossbeam::channel::{bounded, Sender, Receiver as XReceiver};
 use std::time::Instant;
 use std::{fs, io, u32};
 use std::{thread, usize};
@@ -21,9 +21,9 @@ use std::{thread, usize};
 #[derive(Eq, PartialEq)]
 struct SequenceChunk {
     id: u32,
-    data_arena: Vec<u8>,                            // raw bytes for all sequences
-    offsets: Vec<(u32, u32, u32, u32, u32, u32)>,   // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
-    matches: Vec<bool>,                             // k-mer match results
+    data_arena: Vec<u8>,                          // raw bytes for all sequences
+    offsets: Vec<(u32, u32, u32, u32, u32, u32)>, // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
+    matches: Vec<bool>,                           // k-mer match results
 }
 
 // Implement Ord for BinaryHeap to support ordered output
@@ -39,7 +39,7 @@ impl PartialOrd for SequenceChunk {
     }
 }
 
-/// Processing reads against a reference k-mer index 
+/// Processing reads against a reference k-mer index
 pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let available_threads = num_cpus::get();
     let num_threads = args
@@ -47,8 +47,11 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
         .unwrap_or(available_threads)
         .min(available_threads);
 
-    rayon::ThreadPoolBuilder::new().num_threads(num_threads).stack_size(4 * 1024 * 1024)
-        .build_global().expect("Could not build Rayon Pool with specified thread amount");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .stack_size(12 * 1024 * 1024)
+        .build_global()
+        .expect("Could not build Rayon Pool with specified thread amount");
 
     let k = args.k.unwrap_or(21);
     let min_hits = args.minhits.unwrap_or(1);
@@ -66,30 +69,23 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     }
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
-    let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical);
+    let bloom_size = parse_memory_size(&args.bloomsize.unwrap_or("16M".to_string())).unwrap();
+
+    let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical, bloom_size as usize);
 
     // Try loading pre-built k-mer index, otherwise build from scratch
     match load_serialized_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
             let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|vec| vec.len()).sum();
-            println!(
-                "\nLoaded {} k-mers from {}",
-                total_kmers,
-                bin_kmers_path
-            )
+            println!("\nLoaded {} k-mers from {}", total_kmers, bin_kmers_path)
         }
         Err(e) => {
             eprintln!("\nInvalid serialized reference file: {}", e);
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-                    let total_kmers: usize = kmer_processor.ref_kmers.iter()
-                    .map(|v| v.len()).sum();
-                    println!(
-                        "Added {} from {}",
-                        total_kmers,
-                        ref_path,
-                    );
+                    let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|v| v.len()).sum();
+                    println!("Added {} from {}", total_kmers, ref_path,);
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
@@ -156,7 +152,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 mseq_count, matched_percent, mbase_count, mbase_percent
             );
             println!(
-                "Nonmatches:\t\t{} reads ({:.2}%)\t{} bases ({:.2}%)\n",
+                "Nonmatches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)\n",
                 useq_count, unmatched_percent, ubase_count, ubase_percent
             );
         }
@@ -182,9 +178,11 @@ fn load_serialized_kmers(
     let size_metadata = u64::MAX ^ processor.k as u64;
     if !processor.ref_kmers[0].binary_search(&size_metadata).is_ok() {
         processor.ref_kmers.clear();
-        return Err(
-            format!("k-mers are of different length than specified k ({})", processor.k).into(),
-        );
+        return Err(format!(
+            "k-mers are of different length than specified k ({})",
+            processor.k
+        )
+        .into());
     }
 
     Ok(())
@@ -195,7 +193,7 @@ fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
-    const KMER_ID_LENGTH: usize = 12;                 
+    const KMER_ID_LENGTH: usize = 12;
     const KMER_PARTITIONS: usize = 1 << KMER_ID_LENGTH; // 4096 shards
 
     let (sender, receiver) = bounded::<Vec<u8>>(8);
@@ -203,22 +201,32 @@ fn get_reference_kmers(
     spawn_reader(ref_path, sender);
 
     let num_worker_threads = num_cpus::get_physical();
-    let kmer_index: Vec<Vec<Vec<u64>>> = (0..num_worker_threads).into_par_iter()
-        .map(|_| spawn_worker(receiver.clone(), processor.clone())).collect();
+    let kmer_idx: Vec<Vec<Vec<u64>>> = (0..num_worker_threads)
+        .into_par_iter()
+        .map(|_| spawn_worker(receiver.clone(), processor.clone()))
+        .collect();
 
     eprintln!("Extraction complete. Merging thread kmer indices...");
 
     processor.ref_kmers = (0..KMER_PARTITIONS)
-    .into_par_iter()
-    .map(|kmer_id| {
-        let mut merged = Vec::new();
-        for thread_kmer_index in &kmer_index {
-            merged.extend_from_slice(&thread_kmer_index[kmer_id]);
+        .into_par_iter()
+        .map(|kmer_id| {
+            let mut merged_idx = Vec::new();
+            for thread_kmer_idx in &kmer_idx {
+                merged_idx.extend_from_slice(&thread_kmer_idx[kmer_id]);
+            }
+            merged_idx.sort_unstable();
+            merged_idx.dedup();
+            merged_idx
+        })
+        .collect();
+
+    for kmer_id_idx in &processor.ref_kmers {
+        for kmer in kmer_id_idx {
+            let bloom_pos = kmer & processor.bloom_mask;
+            processor.bloom_filter[(bloom_pos / 64) as usize] |= 1 << (bloom_pos % 64);
         }
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    }).collect();
+    }
 
     Ok(())
 }
@@ -237,13 +245,13 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
 }
 
 fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<Vec<u64>> {
-    let mut ref_kmer_index = vec![Vec::<u64>::new(); 4096];
+    let mut ref_kmer_idx = vec![Vec::<u64>::new(); 4096];
 
     while let Ok(seq) = receiver.recv() {
-        processor.process_ref(&seq, &mut ref_kmer_index);
+        processor.process_ref(&seq, &mut ref_kmer_idx);
     }
 
-    ref_kmer_index
+    ref_kmer_idx
 }
 
 /// Save k-mer index to binary file for faster loading later
@@ -260,11 +268,11 @@ fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<
 #[derive(PartialEq, Clone, Copy, Default)]
 enum ProcessMode {
     #[default]
-    Unpaired,           // single-end reads
-    Paired,             // paired-end in two files, output to two files
-    PairedInInterOut,   // paired-end in two files, interleaved output
-    InterInPairedOut,   // interleaved input, paired-end output
-    Interleaved,        // interleaved input and output
+    Unpaired, // single-end reads
+    Paired,           // paired-end in two files, output to two files
+    PairedInInterOut, // paired-end in two files, interleaved output
+    InterInPairedOut, // interleaved input, paired-end output
+    Interleaved,      // interleaved input and output
 }
 
 /// Determine input/output mode based on file arguments
@@ -331,7 +339,7 @@ fn process_reads(
     let (chunk_sender, chunk_receiver): (SyncSender<SequenceChunk>, Receiver<SequenceChunk>) =
         sync_channel(20);
 
-    let chunk_idx = Arc::new(AtomicU32::new(0));
+    let chunk_pos = Arc::new(AtomicU32::new(0));
 
     // Extract file extensions
     let matched_filetype = matched_path.rsplit('.').next().unwrap_or("").to_string();
@@ -346,7 +354,7 @@ fn process_reads(
     let unmatched2_stdout = unmatched2_path == "stdout" || unmatched2_path.starts_with("stdout.");
 
     let parallel_sender = chunk_sender.clone();
-    let parellel_chunk_idx = chunk_idx.clone();
+    let parellel_chunk_pos = chunk_pos.clone();
 
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
     let worker_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -368,7 +376,7 @@ fn process_reads(
             |local_arena: Vec<u8>, local_offsets: Vec<(u32, u32, u32, u32, u32, u32)>| {
                 let processor = processor.clone();
                 let sender = parallel_sender.clone();
-                let current_chunk_idx = parellel_chunk_idx.fetch_add(1, AtomicOrdering::SeqCst);
+                let current_chunk_pos = parellel_chunk_pos.fetch_add(1, AtomicOrdering::SeqCst);
 
                 rayon::spawn(move || {
                     // Parallel k-mer matching: map over offsets to create slices into arena
@@ -383,7 +391,7 @@ fn process_reads(
                         .collect();
 
                     let chunk = SequenceChunk {
-                        id: current_chunk_idx,
+                        id: current_chunk_pos,
                         data_arena: local_arena,
                         offsets: local_offsets,
                         matches,
@@ -507,78 +515,112 @@ fn process_reads(
     let unmatched_bases = Arc::new(AtomicU32::new(0));
 
     // Write a SequenceChunk to disk, reconstructing reads from the arena
-    let mut chunk_output =
-        |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
-            let arena = &chunk.data_arena;
-            let offsets = &chunk.offsets;
-            let matches = &chunk.matches;
+    let mut chunk_output = |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
+        let arena = &chunk.data_arena;
+        let offsets = &chunk.offsets;
+        let matches = &chunk.matches;
 
-            // Slice arena to reconstruct individual read
-            let get_read = |idx: usize| {
-                let (id_s, id_l, seq_s, seq_l, qual_s, qual_l) = offsets[idx];
-                (
-                    &arena[id_s as usize..(id_s + id_l) as usize],
-                    &arena[seq_s as usize..(seq_s + seq_l) as usize],
-                    &arena[qual_s as usize..(qual_s + qual_l) as usize],
-                )
-            };
+        // Slice arena to reconstruct individual read
+        let get_read = |pos: usize| {
+            let (id_s, id_l, seq_s, seq_l, qual_s, qual_l) = offsets[pos];
+            (
+                &arena[id_s as usize..(id_s + id_l) as usize],
+                &arena[seq_s as usize..(seq_s + seq_l) as usize],
+                &arena[qual_s as usize..(qual_s + qual_l) as usize],
+            )
+        };
 
-            if process_mode == ProcessMode::Unpaired {
-                for i in 0..offsets.len() {
-                    let (id, seq, qual) = get_read(i);
-                    if matches[i] {
-                        write_read(
-                            &mut matched_writer,
-                            id,
-                            seq,
-                            qual,
-                            &matched_filetype,
-                            matched_stdout,
-                        )?;
-                        matched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                        matched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
-                    } else {
-                        write_read(
-                            &mut unmatched_writer,
-                            id,
-                            seq,
-                            qual,
-                            &unmatched_filetype,
-                            unmatched_stdout,
-                        )?;
-                        unmatched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                        unmatched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
-                    }
+        if process_mode == ProcessMode::Unpaired {
+            for i in 0..offsets.len() {
+                let (id, seq, qual) = get_read(i);
+                if matches[i] {
+                    write_read(
+                        &mut matched_writer,
+                        id,
+                        seq,
+                        qual,
+                        &matched_filetype,
+                        matched_stdout,
+                    )?;
+                    matched_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    matched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
+                } else {
+                    write_read(
+                        &mut unmatched_writer,
+                        id,
+                        seq,
+                        qual,
+                        &unmatched_filetype,
+                        unmatched_stdout,
+                    )?;
+                    unmatched_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    unmatched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
                 }
-            } else {
-                // Paired-end: process reads in pairs (stride 2)
-                // If either read matches, both are written to matched output
-                for i in (0..offsets.len()).step_by(2) {
-                    let has_match = matches[i] || matches[i + 1];
-                    let (id1, seq1, qual1) = get_read(i);
-                    let (id2, seq2, qual2) = get_read(i + 1);
+            }
+        } else {
+            // Paired-end: process reads in pairs (stride 2)
+            // If either read matches, both are written to matched output
+            for i in (0..offsets.len()).step_by(2) {
+                let has_match = matches[i] || matches[i + 1];
+                let (id1, seq1, qual1) = get_read(i);
+                let (id2, seq2, qual2) = get_read(i + 1);
 
-                    let (w1, w2, count, bases) = if has_match {
-                        (
-                            &mut matched_writer,
-                            m2_writer.as_mut(),
-                            &matched_count,
-                            &matched_bases,
-                        )
+                let (w1, w2, count, bases) = if has_match {
+                    (
+                        &mut matched_writer,
+                        m2_writer.as_mut(),
+                        &matched_count,
+                        &matched_bases,
+                    )
+                } else {
+                    (
+                        &mut unmatched_writer,
+                        u2_writer.as_mut(),
+                        &unmatched_count,
+                        &unmatched_bases,
+                    )
+                };
+
+                write_read(
+                    w1,
+                    id1,
+                    seq1,
+                    qual1,
+                    if has_match {
+                        &matched_filetype
                     } else {
-                        (
-                            &mut unmatched_writer,
-                            u2_writer.as_mut(),
-                            &unmatched_count,
-                            &unmatched_bases,
-                        )
-                    };
+                        &unmatched_filetype
+                    },
+                    if has_match {
+                        matched_stdout
+                    } else {
+                        unmatched_stdout
+                    },
+                )?;
 
+                if let Some(w2_real) = w2 {
+                    write_read(
+                        w2_real,
+                        id2,
+                        seq2,
+                        qual2,
+                        if has_match {
+                            &matched2_filetype
+                        } else {
+                            &unmatched2_filetype
+                        },
+                        if has_match {
+                            matched2_stdout
+                        } else {
+                            unmatched2_stdout
+                        },
+                    )?;
+                } else {
                     write_read(
                         w1,
-                        id1,
-                        seq1,
-                        qual1,
+                        id2,
+                        seq2,
+                        qual2,
                         if has_match {
                             &matched_filetype
                         } else {
@@ -590,49 +632,14 @@ fn process_reads(
                             unmatched_stdout
                         },
                     )?;
-
-                    if let Some(w2_real) = w2 {
-                        write_read(
-                            w2_real,
-                            id2,
-                            seq2,
-                            qual2,
-                            if has_match {
-                                &matched2_filetype
-                            } else {
-                                &unmatched2_filetype
-                            },
-                            if has_match {
-                                matched2_stdout
-                            } else {
-                                unmatched2_stdout
-                            },
-                        )?;
-                    } else {
-                        write_read(
-                            w1,
-                            id2,
-                            seq2,
-                            qual2,
-                            if has_match {
-                                &matched_filetype
-                            } else {
-                                &unmatched_filetype
-                            },
-                            if has_match {
-                                matched_stdout
-                            } else {
-                                unmatched_stdout
-                            },
-                        )?;
-                    }
-
-                    count.fetch_add(2, AtomicOrdering::Relaxed);
-                    bases.fetch_add((seq1.len() + seq2.len()) as u32, AtomicOrdering::Relaxed);
                 }
+
+                count.fetch_add(2, AtomicOrdering::Relaxed);
+                bases.fetch_add((seq1.len() + seq2.len()) as u32, AtomicOrdering::Relaxed);
             }
-            Ok(())
-        };
+        }
+        Ok(())
+    };
 
     if ordered_output {
         // Ordered mode: use min-heap to reorder chunks as they arrive

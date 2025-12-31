@@ -3,21 +3,23 @@ use std::cmp::min;
 /// K-mer processor for building reference indices and filtering reads
 #[derive(Clone)]
 pub struct KmerProcessor {
-    pub k: usize,                   
-    pub threshold: u8,              
-    pub use_canonical: bool,        
-    pub ref_kmers: Vec<Vec<u64>>,   
-    pub bit_cap: u64,               
-    pub kmer_id_length: usize,      
+    pub k: usize,
+    pub threshold: u8,
+    pub use_canonical: bool,
+    pub ref_kmers: Vec<Vec<u64>>,
+    pub bit_cap: u64,
+    pub kmer_id_length: usize,
+    pub bloom_mask: u64,
+    pub bloom_filter: Vec<u64>,
 }
 
 impl KmerProcessor {
-    pub fn new(k: usize, threshold: u8, use_canonical: bool) -> Self {
+    pub fn new(k: usize, threshold: u8, use_canonical: bool, bloom_size: usize) -> Self {
         // Initialize with empty vectors to avoid index out of bounds during parallel build
         let kmer_id_length = 12;
         let num_partitions = 1 << kmer_id_length;
         let mut ref_kmers = vec![Vec::new(); num_partitions];
-        
+
         // Store metadata in the first bucket (optional, kept for compatibility)
         let metadata = u64::MAX ^ k as u64;
         ref_kmers[0].push(metadata);
@@ -27,9 +29,15 @@ impl KmerProcessor {
             threshold,
             use_canonical,
             ref_kmers,
-            // Safe bit shifting for u64
-            bit_cap: if k >= 32 { u64::MAX } else { (1u64 << (k * 2)) - 1 },
+            // Safe bit cap for k = 32
+            bit_cap: if k >= 32 {
+                u64::MAX
+            } else {
+                (1u64 << (k * 2)) - 1
+            },
             kmer_id_length,
+            bloom_mask: bloom_size as u64 * 64 - 1,
+            bloom_filter: vec![0u64; bloom_size],
         }
     }
 
@@ -49,9 +57,8 @@ impl KmerProcessor {
                     } else {
                         kmer
                     };
-                    
+
                     let sid = self.map_kmer(&kmer_to_store);
-                    // Just push; sorting happens during merge phase
                     kmer_index[sid].push(kmer_to_store);
                 }
             } else {
@@ -76,11 +83,11 @@ impl KmerProcessor {
             match encode(base) {
                 Some(encoded_base) => {
                     kmer = ((kmer << 2) | encoded_base) & self.bit_cap;
-                    
+
                     // Update rc kmer: (rc >> 2) | (complement << shift)
                     let encoded_rc_base = encoded_base ^ 0b11; // Inverse of bits (A=00->T=11)
                     rc_kmer = (rc_kmer >> 2) | (encoded_rc_base << (2 * (self.k - 1)));
-                    
+
                     valid_bases += 1;
 
                     if valid_bases >= self.k {
@@ -112,6 +119,11 @@ impl KmerProcessor {
 
     #[inline(always)]
     fn contains_kmer(&self, kmer: &u64) -> bool {
+        let bloom_pos = kmer & self.bloom_mask;
+        if self.bloom_filter[(bloom_pos / 64) as usize] & 1 << (bloom_pos % 64) == 0 {
+            return false;
+        }
+
         let kmer_id = self.map_kmer(kmer);
         self.ref_kmers[kmer_id].binary_search(kmer).is_ok()
     }
@@ -120,7 +132,6 @@ impl KmerProcessor {
     fn map_kmer(&self, kmer: &u64) -> usize {
         (kmer >> (2 * self.k - self.kmer_id_length)) as usize
     }
-
 }
 
 // Optimized base lookup using const array (avoids stack init overhead)
@@ -130,14 +141,19 @@ fn encode(b: u8) -> Option<u64> {
     // A=00, C=01, G=10, T/U=11
     static BASE_TABLE: [u8; 256] = {
         let mut bases = [INVALID; 256];
-        bases[b'A' as usize] = 0; bases[b'a' as usize] = 0;
-        bases[b'C' as usize] = 1; bases[b'c' as usize] = 1;
-        bases[b'G' as usize] = 2; bases[b'g' as usize] = 2;
-        bases[b'T' as usize] = 3; bases[b't' as usize] = 3;
-        bases[b'U' as usize] = 3; bases[b'u' as usize] = 3;
+        bases[b'A' as usize] = 0;
+        bases[b'a' as usize] = 0;
+        bases[b'C' as usize] = 1;
+        bases[b'c' as usize] = 1;
+        bases[b'G' as usize] = 2;
+        bases[b'g' as usize] = 2;
+        bases[b'T' as usize] = 3;
+        bases[b't' as usize] = 3;
+        bases[b'U' as usize] = 3;
+        bases[b'u' as usize] = 3;
         bases
     };
-    
+
     let v = unsafe { *BASE_TABLE.get_unchecked(b as usize) };
     if v == INVALID { None } else { Some(v as u64) }
 }
