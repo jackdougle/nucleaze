@@ -16,8 +16,9 @@ pub struct KmerProcessor {
 
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool, bloom_size: usize) -> Self {
-        let kmer_id_length = 12; // sort with first 6 bases
+        let kmer_id_length = min(12, k * 2); // sort with up to first six bases
         let num_partitions = 1 << kmer_id_length;
+        println!("KmerProcessor w/ k: {} and canonical use: {}", k, use_canonical);
 
         KmerProcessor {
             k,
@@ -47,11 +48,14 @@ impl KmerProcessor {
 
                 if valid_bases >= self.k {
                     let kmer_to_store = if self.use_canonical {
-                        canonical((kmer, 0)).0.0
+                        let canonical = canonical((kmer, self.k as u8)).0.0;
+                        println!("{}", canonical);
+                        canonical
                     } else {
                         kmer
                     };
 
+                    println!("{}", kmer_to_store);
                     let sid = self.map_kmer(&kmer_to_store);
                     kmer_index[sid].push(kmer_to_store);
                 }
@@ -86,7 +90,7 @@ impl KmerProcessor {
 
                     if valid_bases >= self.k {
                         let is_hit = if self.use_canonical {
-                            let canonical_kmer = min(kmer, rc_kmer);
+                            let canonical_kmer = std::cmp::min(kmer, rc_kmer);
                             self.contains_kmer(&canonical_kmer)
                         } else {
                             self.contains_kmer(&kmer)
