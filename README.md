@@ -52,7 +52,6 @@ If using Windows, download the correct installer from [Rustup](https://rustup.rs
 ### **2. Download the release executable**
 
 ```bash
-brew tap jackdougle/nucleaze
 brew install nucleaze
 ```
 
@@ -100,25 +99,6 @@ Bases Processed:      150.00m bases             1000.00m bases/sec
 ```
 
 ---
-
-### **Program Stages**
-
-1. **Load reference k-mers**  
-   - If serialized reference k-mer index exists, loads using Bincode  
-   - Else, parses reference FASTA reference file and builds k-mer index  
-   - Serializes for future runs if `--binref <File>` is provided
-
-2. **Process reads in chunks**  
-   - Reads are batched into chunks of 10,000 records  
-   - Each chunk is then processed in parallel using Rayon
-
-3. **Output matched/unmatched reads**  
-   - Results are written as they are processed  
-   - Separate or interleaved output depending on mode
-   - Supports second pair of output files for 2nd pair of reads, if paired
-
-4. **Statistics collection**  
-   - Atomic counters track total reads and bases matched/unmatched and processing speed
 
 ### **Processing Modes**
 Nucleaze automatically detects the appropriate read handling mode:

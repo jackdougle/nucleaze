@@ -8,7 +8,7 @@ use std::time::Instant;
 
 const ABOUT: &str = "Nucleaze 1.3.0
 Written by Jack Douglass
-Last modified December 19, 2025
+Last modified January 2nd, 2026
 
 Nucleaze compares DNA sequences from input file to DNA sequences from reference
  file using k-mer analysis. Splits up reference file sequences into k-mers of
@@ -61,6 +61,9 @@ MEMORY & PERFORMANCE PARAMETERS
                         sequence ID.
     --canonical         (-c) K-mers are stored and compared in canonical form 
                         (lowest of forward and reverse-complement).
+    --bloomsize 16M     (-f) Memory size of Bloom filter in human-readable
+                        format. '-l 64M' delegates 64 MB of memory to the Bloom
+                        filter. 16 Mb by default.
 
 Function and usage documentation at /README.md.
 Contact jack.gdouglass@gmail.com for any questions or issues encountered.
@@ -133,8 +136,8 @@ struct Args {
     #[arg(short, long)]
     canonical: bool,
 
-    /// Size of Bloom filter in human readable format
-    #[arg(short, long)]
+    /// Size of Bloom filter in human-readable format
+    #[arg(short = 'f', long)]
     bloomsize: Option<String>,
 }
 

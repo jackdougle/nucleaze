@@ -2,10 +2,12 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs::{self, File};
 use std::io::Write;
+use std::path::Path;
 use tempfile::TempDir;
 
-// Helper function to create test FASTQ files
-fn create_fastq(path: &str, records: &[(&str, &str, &str)]) -> std::io::Result<()> {
+// --- Helper Functions ---
+
+fn create_fastq(path: &Path, records: &[(&str, &str, &str)]) -> std::io::Result<()> {
     let mut file = File::create(path)?;
     for (id, seq, qual) in records {
         writeln!(file, "@{}", id)?;
@@ -16,8 +18,7 @@ fn create_fastq(path: &str, records: &[(&str, &str, &str)]) -> std::io::Result<(
     Ok(())
 }
 
-// Helper for FASTA files
-fn create_fasta(path: &str, records: &[(&str, &str)]) -> std::io::Result<()> {
+fn create_fasta(path: &Path, records: &[(&str, &str)]) -> std::io::Result<()> {
     let mut file = File::create(path)?;
     for (id, seq) in records {
         writeln!(file, ">{}", id)?;
@@ -25,6 +26,498 @@ fn create_fasta(path: &str, records: &[(&str, &str)]) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+fn nucleaze_cmd() -> Command {
+    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
+        "nucleaze"
+    )))
+}
+
+// --- Basic Filtering Tests ---
+
+#[test]
+fn test_basic_filtering_unpaired() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    // Reference: simple ACGT pattern
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")]).unwrap();
+
+    // Reads: 1 match, 1 total mismatch, 1 partial mismatch (suffix differs)
+    create_fastq(
+        &reads_path,
+        &[
+            ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // Match
+            ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // Mismatch
+            ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // Mismatch (partial)
+        ],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("21")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(matched.contains("read1"));
+    assert!(!matched.contains("read2"));
+    assert!(!matched.contains("read3"));
+
+    let unmatched = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(!unmatched.contains("read1"));
+    assert!(unmatched.contains("read2"));
+    assert!(unmatched.contains("read3"));
+}
+
+#[test]
+fn test_filtering_ambiguous_sequences() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(&ref_path, &[("ref1", "ACGTAAAAAAAAAAAAAAAAA")]).unwrap();
+
+    // 'N' bases should break the k-mer chain
+    create_fastq(
+        &reads_path,
+        &[("read1", "ACGTNNNNNNNNNNNNNNNNN", "IIIIIIIIIIIIIIIIIIIII")],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("10")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(!matched.contains("read1"));
+
+    let unmatched = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(unmatched.contains("read1"));
+}
+
+// --- Paired and Interleaved I/O Tests ---
+
+#[test]
+fn test_interleaved_input_separate_output() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("interleaved.fq");
+    let matched1_path = temp.path().join("m1.fq");
+    let matched2_path = temp.path().join("m2.fq");
+    let unmatched1_path = temp.path().join("u1.fq");
+    let unmatched2_path = temp.path().join("u2.fq");
+
+    create_fasta(&ref_path, &[("ref1", "AAAAA")]).unwrap();
+
+    // R1 matches, R2 mismatches -> Both should go to matched because they are paired
+    // R3 mismatches, R4 mismatches -> Both to unmatched
+    create_fastq(
+        &reads_path,
+        &[
+            ("read1/1", "AAAAA", "IIIII"), // Match
+            ("read1/2", "TTTTT", "IIIII"), // Mismatch, but pair matches
+            ("read2/1", "CCCCC", "IIIII"), // Mismatch
+            ("read2/2", "GGGGG", "IIIII"), // Mismatch
+        ],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched1_path)
+        .arg("--outm2")
+        .arg(&matched2_path)
+        .arg("--outu")
+        .arg(&unmatched1_path)
+        .arg("--outu2")
+        .arg(&unmatched2_path)
+        .arg("--interinput") // Critical flag
+        .arg("--k")
+        .arg("5")
+        .assert()
+        .success();
+
+    // Check Pair 1 (Matched)
+    let m1 = fs::read_to_string(&matched1_path).unwrap();
+    let m2 = fs::read_to_string(&matched2_path).unwrap();
+    assert!(m1.contains("read1/1"));
+    assert!(m2.contains("read1/2"));
+
+    // Check Pair 2 (Unmatched)
+    let u1 = fs::read_to_string(&unmatched1_path).unwrap();
+    let u2 = fs::read_to_string(&unmatched2_path).unwrap();
+    assert!(u1.contains("read2/1"));
+    assert!(u2.contains("read2/2"));
+}
+
+#[test]
+fn test_paired_input_files() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let r1_path = temp.path().join("r1.fq");
+    let r2_path = temp.path().join("r2.fq");
+    let m1_path = temp.path().join("m1.fq");
+    let m2_path = temp.path().join("m2.fq");
+    let u1_path = temp.path().join("u1.fq");
+    let u2_path = temp.path().join("u2.fq");
+
+    create_fasta(&ref_path, &[("ref", "AAAAA")]).unwrap();
+
+    // Pair 1: R1 matches
+    create_fastq(
+        &r1_path,
+        &[("p1_1", "AAAAA", "IIIII"), ("p2_1", "TTTTT", "IIIII")],
+    )
+    .unwrap();
+    // Pair 2: Neither matches
+    create_fastq(
+        &r2_path,
+        &[("p1_2", "CCCCC", "IIIII"), ("p2_2", "GGGGG", "IIIII")],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&r1_path)
+        .arg("--in2")
+        .arg(&r2_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&m1_path)
+        .arg("--outm2")
+        .arg(&m2_path)
+        .arg("--outu")
+        .arg(&u1_path)
+        .arg("--outu2")
+        .arg(&u2_path)
+        .arg("--k")
+        .arg("5")
+        .assert()
+        .success();
+
+    assert!(fs::read_to_string(&m1_path).unwrap().contains("p1_1"));
+    assert!(fs::read_to_string(&m2_path).unwrap().contains("p1_2"));
+    assert!(fs::read_to_string(&u1_path).unwrap().contains("p2_1"));
+    assert!(fs::read_to_string(&u2_path).unwrap().contains("p2_2"));
+}
+
+#[test]
+fn test_missing_interleaved_flag_failure() {
+    // This tests the logic that detects missing --interinput flag
+    // based on arg combinations
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+
+    create_fasta(&ref_path, &[("ref", "AAAAA")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "AAAAA", "IIIII")]).unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        // Providing paired OUTPUTs for single INPUT implies interleaved,
+        // but without --interinput flag, this should fail/panic.
+        .arg("--outm")
+        .arg("m1.fq")
+        .arg("--outm2")
+        .arg("m2.fq")
+        .arg("--outu")
+        .arg("u1.fq")
+        .arg("--outu2")
+        .arg("u2.fq")
+        .assert()
+        .failure();
+}
+
+// --- New Architecture Tests (Bloom Filter & Serialization) ---
+
+#[test]
+fn test_serialized_reference_persistence() {
+    // This test ensures the new Vec+Bloom system can serialize and deserialize correctly.
+    // NOTE: This test verifies that the binary format works as expected.
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let bin_path = temp.path().join("ref.bin");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(&ref_path, &[("ref", "ACGTACGT")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "ACGTACGT", "IIIIIIII")]).unwrap();
+
+    // 1. Run to generate the binary reference
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--saveref")
+        .arg(&bin_path) // Save the index
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("8")
+        .assert()
+        .success();
+
+    assert!(bin_path.exists(), "Binary reference file was not created");
+
+    // Clear outputs
+    fs::remove_file(&matched_path).unwrap();
+
+    // 2. Run using the binary reference
+    // This stresses the load_serialized_kmers function.
+    // IF the Bloom filter is not rebuilt on load, this step will find 0 matches!
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--binref")
+        .arg(&bin_path) // Load the index
+        // No --ref argument here
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("8")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(
+        matched.contains("r1"),
+        "Failed to match read using loaded binary reference"
+    );
+}
+
+#[test]
+fn test_bloom_filter_configuration() {
+    // Tests that the new --bloomsize argument is accepted and functional
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(&ref_path, &[("ref", "ACGTACGT")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "ACGTACGT", "IIIIIIII")]).unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("8")
+        .arg("--bloomsize")
+        .arg("4M") // Explicitly set bloom size
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(matched.contains("r1"));
+}
+
+// --- Parameter Validation Tests ---
+
+#[test]
+fn test_minhits_threshold() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(&ref_path, &[("ref", "AAAAA")]).unwrap();
+    // Read has 5 bases.
+    // k=4.
+    // kmers: AAAA, AAAA (2 kmers).
+    create_fastq(&reads_path, &[("r1", "AAAAA", "IIIII")]).unwrap();
+
+    // With minhits=2, it should match (both kmers match)
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("4")
+        .arg("--minhits")
+        .arg("2")
+        .assert()
+        .success();
+
+    assert!(fs::read_to_string(&matched_path).unwrap().contains("r1"));
+
+    fs::remove_file(&matched_path).unwrap();
+
+    // With minhits=3, it should FAIL (only 2 kmers total)
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("4")
+        .arg("--minhits")
+        .arg("3")
+        .assert()
+        .success(); // Command succeeds, but read is unmatched
+
+    assert!(!fs::read_to_string(&matched_path).unwrap().contains("r1"));
+    assert!(fs::read_to_string(&unmatched_path).unwrap().contains("r1"));
+}
+
+#[test]
+fn test_memory_allocation_limits() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+
+    create_fasta(&ref_path, &[("ref", "ACGT")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "ACGT", "IIII")]).unwrap();
+
+    // Impossible memory limit
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--k")
+        .arg("4")
+        .arg("--maxmem")
+        .arg("1B")
+        .assert()
+        .failure();
+
+    // Reasonable memory limit
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--k")
+        .arg("4")
+        .arg("--maxmem")
+        .arg("100M")
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_canonical_kmers() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    // Ref: All T's
+    create_fasta(&ref_path, &[("ref", "TTTTT")]).unwrap();
+    // Read: All A's (Reverse complement of TTTTT)
+    create_fastq(&reads_path, &[("r1", "AAAAA", "IIIII")]).unwrap();
+
+    // 1. Without canonical, AAAAA != TTTTT
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("5")
+        .assert()
+        .success();
+
+    assert!(fs::read_to_string(&unmatched_path).unwrap().contains("r1"));
+
+    // 2. With canonical, AAAAA == TTTTT (rc)
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("5")
+        .arg("--canonical")
+        .assert()
+        .success();
+
+    assert!(fs::read_to_string(&matched_path).unwrap().contains("r1"));
+}
+
+#[test]
+fn test_duplicate_file_args_error() {
+    let temp = TempDir::new().unwrap();
+    let p = temp.path().join("f.fq");
+    create_fastq(&p, &[("r", "A", "I")]).unwrap();
+
+    // Same file for input 1 and 2
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&p)
+        .arg("--in2")
+        .arg(&p)
+        .arg("--ref")
+        .arg(&p)
+        .assert()
+        .failure();
+}
+
+// Note: helper functions above using &Path are preferred.
 
 #[test]
 fn test_basic_filtering_unpaired() {
@@ -36,14 +529,14 @@ fn test_basic_filtering_unpaired() {
 
     // Create reference with known sequences
     create_fasta(
-        ref_path.to_str().unwrap(),
+        &ref_path,
         &[("ref1", "ACGTACGTACGTACGTACGTA")],
     )
     .unwrap();
 
     // Create reads: some match, some don't
     create_fastq(
-        reads_path.to_str().unwrap(),
+        &reads_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // match
             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // total non-match
@@ -60,13 +553,13 @@ fn test_basic_filtering_unpaired() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .arg("--k")
     .arg("21")
     .assert()
@@ -87,52 +580,6 @@ fn test_basic_filtering_unpaired() {
 }
 
 #[test]
-fn test_filtering_ambiguous_sequences() {
-    let temp = TempDir::new().unwrap();
-    let ref_path = temp.path().join("ref.fa");
-    let reads_path = temp.path().join("reads.fq");
-    let matched_path = temp.path().join("matched.fq");
-    let unmatched_path = temp.path().join("unmatched.fq");
-
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTAAAAAAAAAAAAAAAAA")],
-    )
-    .unwrap();
-
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTNNNNNNNNNNNNNNNNN", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
-
-    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
-        "nucleaze"
-    )))
-    .arg("--in")
-    .arg(reads_path.to_str().unwrap())
-    .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
-    .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
-    .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
-    .arg("--k")
-    .arg("10")
-    .assert()
-    .success();
-
-    assert!(matched_path.exists());
-    assert!(unmatched_path.exists());
-
-    let matched_content = fs::read_to_string(&matched_path).unwrap();
-    assert!(!matched_content.contains("read1"));
-
-    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
-    assert!(unmatched_content.contains("read1"));
-}
-
-#[test]
 fn test_interleaved() {
     let temp = TempDir::new().unwrap();
     let ref_path = temp.path().join("ref.fa");
@@ -140,14 +587,9 @@ fn test_interleaved() {
     let matched_path = temp.path().join("matched1.fq");
     let unmatched_path = temp.path().join("unmatched1.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
+    create_fastq(&reads_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"),
             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
@@ -161,13 +603,13 @@ fn test_interleaved() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .arg("--interinput")
     .assert()
     .success();
@@ -197,14 +639,9 @@ fn test_inter_in_paired_out() {
     let unmatched1_path = temp.path().join("unmatched1.fq");
     let unmatched2_path = temp.path().join("unmatched2.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
+    create_fastq(&reads_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"),
             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
@@ -218,17 +655,17 @@ fn test_inter_in_paired_out() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched1_path.to_str().unwrap())
+    .arg(&matched1_path)
     .arg("--outm2")
-    .arg(matched2_path.to_str().unwrap())
+    .arg(&matched2_path)
     .arg("--outu")
-    .arg(unmatched1_path.to_str().unwrap())
+    .arg(&unmatched1_path)
     .arg("--outu2")
-    .arg(unmatched2_path.to_str().unwrap())
+    .arg(&unmatched2_path)
     .arg("--interinput")
     .assert()
     .success();
@@ -263,14 +700,9 @@ fn test_inter_in_paired_out_no_flag() {
     let unmatched1_path = temp.path().join("unmatched1.fq");
     let unmatched2_path = temp.path().join("unmatched2.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
+    create_fastq(&reads_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"),
             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
@@ -284,17 +716,17 @@ fn test_inter_in_paired_out_no_flag() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched1_path.to_str().unwrap())
+    .arg(&matched1_path)
     .arg("--outm2")
-    .arg(matched2_path.to_str().unwrap())
+    .arg(&matched2_path)
     .arg("--outu")
-    .arg(unmatched1_path.to_str().unwrap())
+    .arg(&unmatched1_path)
     .arg("--outu2")
-    .arg(unmatched2_path.to_str().unwrap())
+    .arg(&unmatched2_path)
     .assert()
     .failure();
 }
@@ -308,27 +740,18 @@ fn test_paired_in_inter_out() {
     let matched_path = temp.path().join("matched1.fq");
     let unmatched_path = temp.path().join("unmatched1.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")],).unwrap();
 
-    create_fastq(
-        reads1_path.to_str().unwrap(),
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")])
+            ("read3", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
+    create_fastq(&reads_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"),
-            ("read3", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
+            ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
+            ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"),
         ],
     )
     .unwrap();
-
-    create_fastq(
-        reads2_path.to_str().unwrap(),
-        &[
-            ("read2", "CCCCCCCCCCCCCCCCCCCCC", "IIIIIIIIIIIIIIIIIIIII"),
-            ("read4", "GGGGGGGGGGGGGGGGGGGGG", "IIIIIIIIIIIIIIIIIIIII"),
-        ],
     )
     .unwrap();
 
@@ -336,15 +759,15 @@ fn test_paired_in_inter_out() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads1_path.to_str().unwrap())
+    .arg(&reads1_path)
     .arg("--in2")
-    .arg(reads2_path.to_str().unwrap())
+    .arg(&reads2_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .assert()
     .success();
 
@@ -375,14 +798,9 @@ fn test_paired_reads() {
     let unmatched1_path = temp.path().join("unmatched1.fq");
     let unmatched2_path = temp.path().join("unmatched2.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")]).unwrap();
 
-    create_fastq(
-        reads1_path.to_str().unwrap(),
+    create_fastq(&reads1_path,
         &[
             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"),
             ("read3", "GGGGGGGGGGGGGGGGGGGGG", "IIIIIIIIIIIIIIIIIIIII"),
@@ -390,8 +808,7 @@ fn test_paired_reads() {
     )
     .unwrap();
 
-    create_fastq(
-        reads2_path.to_str().unwrap(),
+    create_fastq(&reads2_path,
         &[
             ("read2", "GGGGGGGGGGGGGGGGGGGGG", "IIIIIIIIIIIIIIIIIIIII"),
             ("read4", "GGGGGGGGGGGGGGGGGGGGG", "IIIIIIIIIIIIIIIIIIIII"),
@@ -403,19 +820,19 @@ fn test_paired_reads() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads1_path.to_str().unwrap())
+    .arg(&reads1_path)
     .arg("--in2")
-    .arg(reads2_path.to_str().unwrap())
+    .arg(&reads2_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched1_path.to_str().unwrap())
+    .arg(&matched1_path)
     .arg("--outm2")
-    .arg(matched2_path.to_str().unwrap())
+    .arg(&matched2_path)
     .arg("--outu")
-    .arg(unmatched1_path.to_str().unwrap())
+    .arg(&unmatched1_path)
     .arg("--outu2")
-    .arg(unmatched2_path.to_str().unwrap())
+    .arg(&unmatched2_path)
     .assert()
     .success();
 
@@ -449,15 +866,12 @@ fn test_serialized_reference() {
     let unmatched_path = temp.path().join("unmatched.fq");
 
     create_fasta(
-        ref_path.to_str().unwrap(),
+        &ref_path,
         &[("ref1", "ACGTACGTACGTACGTACGTG")],
     )
     .unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTG", "IIIIIIIIIIIIIIIIIIIII")],
-    )
+    create_fastq(&reads_path, &[("read1", "ACGTACGTACGTACGTACGTG", "IIIIIIIIIIIIIIIIIIIII")],)
     .unwrap();
 
     // First run: create serialized reference
@@ -465,15 +879,15 @@ fn test_serialized_reference() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--saveref")
-    .arg(bin_path.to_str().unwrap())
+    .arg(&bin_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .assert()
     .success();
 
@@ -488,15 +902,15 @@ fn test_serialized_reference() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--binref")
-    .arg(bin_path.to_str().unwrap())
+    .arg(&bin_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .assert()
     .success()
     .stdout(predicate::str::contains("Loaded"));
@@ -514,11 +928,7 @@ fn test_different_k_values() {
     )
     .unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path, &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
     for k in [5, 11, 15, 21].iter() {
         let matched = temp.path().join(format!("matched_k{}.fq", k));
@@ -528,13 +938,13 @@ fn test_different_k_values() {
             "nucleaze"
         )))
         .arg("--in")
-        .arg(reads_path.to_str().unwrap())
+        .arg(&reads_path)
         .arg("--ref")
-        .arg(ref_path.to_str().unwrap())
+        .arg(&ref_path)
         .arg("--outm")
-        .arg(matched.to_str().unwrap())
+        .arg(&matched)
         .arg("--outu")
-        .arg(unmatched.to_str().unwrap())
+        .arg(&unmatched)
         .arg("--k")
         .arg(k.to_string())
         .assert()
@@ -542,64 +952,61 @@ fn test_different_k_values() {
     }
 }
 
-#[test]
-fn test_memory_allocation() {
-    let temp = TempDir::new().unwrap();
-    let ref_path = temp.path().join("ref.fa");
-    let reads_path = temp.path().join("reads.fq");
+// #[test]
+// fn test_memory_allocation() {
+//     let temp = TempDir::new().unwrap();
+//     let ref_path = temp.path().join("ref.fa");
+//     let reads_path = temp.path().join("reads.fq");
 
-    // Create reference with known sequences
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+//     // Create reference with known sequences
+//     create_fasta(
+//         ref_path.to_str().unwrap(),
+//         &[("ref1", "ACGTACGTACGTACGTACGTA")],
+//     )
+//     .unwrap();
 
-    // Create reads: some match, some don't
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[
-            ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // match
-            ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // total non-match
-            ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // partial non-match
-        ],
-    )
-    .unwrap();
+//     // Create reads: some match, some don't
+//     create_fastq(
+//         reads_path.to_str().unwrap(),
+//         &[
+//             ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // match
+//             ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // total non-match
+//             ("read3", "ACGTACGTACGTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // partial non-match
+//         ],
+//     )
+//     .unwrap();
 
-    assert!(ref_path.exists());
-    assert!(reads_path.exists());
+//     assert!(ref_path.exists());
+//     assert!(reads_path.exists());
 
-    // Run nucleaze with no memory allocated
-    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
-        "nucleaze"
-    )))
-    .arg("--in")
-    .arg(reads_path.to_str().unwrap())
-    .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
-    .arg("--k")
-    .arg("21")
-    .arg("--maxmem")
-    .arg("1B")
-    .assert()
-    .failure();
+//     // Run nucleaze with no memory allocated
+//     Command::cargo_bin("nucleaze")
+//         .unwrap()
+//         .arg("--in")
+//         .arg(reads_path.to_str().unwrap())
+//         .arg("--ref")
+//         .arg(ref_path.to_str().unwrap())
+//         .arg("--k")
+//         .arg("21")
+//         .arg("--maxmem")
+//         .arg("1B")
+//         .assert()
+//         .failure();
 
-    // Run nucleaze with enough memory allocated
-    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
-        "nucleaze"
-    )))
-    .arg("--in")
-    .arg(reads_path.to_str().unwrap())
-    .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
-    .arg("--k")
-    .arg("21")
-    .arg("--maxmem")
-    .arg("1G")
-    .assert()
-    .success();
-}
-
+//     // Run nucleaze with enough memory allocated
+//     Command::cargo_bin("nucleaze")
+//         .unwrap()
+//         .arg("--in")
+//         .arg(reads_path.to_str().unwrap())
+//         .arg("--ref")
+//         .arg(ref_path.to_str().unwrap())
+//         .arg("--k")
+//         .arg("21")
+//         .arg("--maxmem")
+//         .arg("1G")
+//         .assert()
+//         .success();
+// }
 #[test]
 fn test_duplicate_read_files() {
     let temp = TempDir::new().unwrap();
@@ -609,37 +1016,25 @@ fn test_duplicate_read_files() {
     let matched_path = temp.path().join("matched.fq");
     let unmatched_path = temp.path().join("unmatched.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTC")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTC")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path, &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
-    create_fastq(
-        reads_path_dup.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path_dup, &[("read1", "ACGTACGTACGTACGTACGTC", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
     Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--in2")
-    .arg(reads_path_dup.to_str().unwrap())
+    .arg(&reads_path_dup)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .assert()
     .failure();
 }
@@ -652,30 +1047,22 @@ fn test_minhits_threshold() {
     let matched_path = temp.path().join("matched.fq");
     let unmatched_path = temp.path().join("unmatched.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTA")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTATTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path, &[("read1", "ACGTATTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
     // With minhits=1, should match
     Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .arg("--k")
     .arg("4")
     .arg("--minhits")
@@ -703,23 +1090,19 @@ fn test_fasta_output_format() {
     )
     .unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path, &[("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
     Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_fasta_path.to_str().unwrap())
+    .arg(&matched_fasta_path)
     .arg("--outu")
-    .arg(unmatched_fasta_path.to_str().unwrap())
+    .arg(&unmatched_fasta_path)
     .assert()
     .success();
 
@@ -733,13 +1116,13 @@ fn test_fasta_output_format() {
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_fastq_path.to_str().unwrap())
+    .arg(&matched_fastq_path)
     .arg("--outu")
-    .arg(unmatched_fastq_path.to_str().unwrap())
+    .arg(&unmatched_fastq_path)
     .assert()
     .success();
 
@@ -766,110 +1149,23 @@ fn test_threads_argument() {
     let matched_path = temp.path().join("matched.fq");
     let unmatched_path = temp.path().join("unmatched.fq");
 
-    create_fasta(
-        ref_path.to_str().unwrap(),
-        &[("ref1", "ACGTACGTACGTACGTACGTG")],
-    )
-    .unwrap();
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTG")],).unwrap();
 
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "ACGTACGTACGTACGTACGTG", "IIIIIIIIIIIIIIIIIIIII")],
-    )
-    .unwrap();
+    create_fastq(&reads_path, &[("read1", "ACGTACGTACGTACGTACGTG", "IIIIIIIIIIIIIIIIIIIII")],).unwrap();
 
     Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!(
         "nucleaze"
     )))
     .arg("--in")
-    .arg(reads_path.to_str().unwrap())
+    .arg(&reads_path)
     .arg("--ref")
-    .arg(ref_path.to_str().unwrap())
+    .arg(&ref_path)
     .arg("--outm")
-    .arg(matched_path.to_str().unwrap())
+    .arg(&matched_path)
     .arg("--outu")
-    .arg(unmatched_path.to_str().unwrap())
+    .arg(&unmatched_path)
     .arg("--threads")
     .arg("2")
     .assert()
     .success();
-}
-
-#[test]
-fn test_integration_no_canonical_flag() {
-    let temp = TempDir::new().unwrap();
-    let ref_path = temp.path().join("ref_no_c.fa");
-    let reads_path = temp.path().join("reads_no_c.fq");
-    let matched_path = temp.path().join("matched_no_c.fq");
-    let unmatched_path = temp.path().join("unmatched_no_c.fq");
-
-    // Reference: all T's
-    create_fasta(ref_path.to_str().unwrap(), &[("ref1", "TTTTTTTTTT")]).unwrap();
-
-    // Read: all A's (should not match without canonical flag)
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "AAAAAAAAAA", "IIIIIIIIII")],
-    )
-    .unwrap();
-
-    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!("nucleaze")))
-        .arg("--in")
-        .arg(reads_path.to_str().unwrap())
-        .arg("--ref")
-        .arg(ref_path.to_str().unwrap())
-        .arg("--outm")
-        .arg(matched_path.to_str().unwrap())
-        .arg("--outu")
-        .arg(unmatched_path.to_str().unwrap())
-        .arg("--k")
-        .arg("5")
-        .assert()
-        .success();
-
-    let matched_content = fs::read_to_string(&matched_path).unwrap();
-    assert!(matched_content.trim().is_empty(), "expected no matched reads in non-canonical mode");
-
-    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
-    assert!(unmatched_content.contains("AAAAAAAAAA"));
-}
-
-#[test]
-fn test_integration_with_canonical_flag() {
-    let temp = TempDir::new().unwrap();
-    let ref_path = temp.path().join("ref_c.fa");
-    let reads_path = temp.path().join("reads_c.fq");
-    let matched_path = temp.path().join("matched_c.fq");
-    let unmatched_path = temp.path().join("unmatched_c.fq");
-
-    // Reference: all T's
-    create_fasta(ref_path.to_str().unwrap(), &[("ref1", "TTTTTTTTTT")]).unwrap();
-
-    // Read: all A's (should match when canonical flag enabled)
-    create_fastq(
-        reads_path.to_str().unwrap(),
-        &[("read1", "AAAAAAAAAA", "IIIIIIIIII")],
-    )
-    .unwrap();
-
-    Command::from_std(std::process::Command::new(assert_cmd::cargo::cargo_bin!("nucleaze")))
-        .arg("--in")
-        .arg(reads_path.to_str().unwrap())
-        .arg("--ref")
-        .arg(ref_path.to_str().unwrap())
-        .arg("--outm")
-        .arg(matched_path.to_str().unwrap())
-        .arg("--outu")
-        .arg(unmatched_path.to_str().unwrap())
-        .arg("--k")
-        .arg("5")
-        .arg("--canonical")
-        .assert()
-        .success();
-
-    let matched_content = fs::read_to_string(&matched_path).unwrap();
-    assert!(matched_content.contains("AAAAAAAAAA"));
-
-    let unmatched_content = fs::read_to_string(&unmatched_path).unwrap();
-    assert!(unmatched_content.trim().is_empty());
 }

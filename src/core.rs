@@ -1,4 +1,4 @@
-//! I/O and processing operations for filtering read sequences based on kmer similarity
+//! I/O and processing operations for filtering read sequences based reference kmers
 
 use crate::{kmer_ops::KmerProcessor, parse_memory_size};
 use bincode::{config, decode_from_std_read, encode_into_std_write};
@@ -74,18 +74,26 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical, bloom_size as usize);
 
     // Try loading pre-built k-mer index, otherwise build from scratch
-    match load_serialized_kmers(bin_kmers_path, &mut kmer_processor) {
+    match deserialize_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
             let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|vec| vec.len()).sum();
-            println!("\nLoaded {} k-mers from {}", total_kmers, bin_kmers_path)
+            println!(
+                "\nLoaded {} k-mers from {}",
+                (total_kmers - 1),
+                bin_kmers_path
+            );
+
+            fill_bloom_filter(&mut kmer_processor);
         }
         Err(e) => {
             eprintln!("\nInvalid serialized reference file: {}", e);
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-                    let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|v| v.len()).sum();
-                    println!("Added {} from {}", total_kmers, ref_path,);
+                    let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|v| v.len()).sum(); // includes metadata
+                    println!("Added {} from {}", (total_kmers - 1), ref_path,);
+
+                    fill_bloom_filter(&mut kmer_processor);
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
@@ -165,7 +173,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 }
 
 /// Load a pre-built k-mer index from binary file
-fn load_serialized_kmers(
+fn deserialize_kmers(
     bin_kmers_path: &str,
     processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
@@ -173,10 +181,9 @@ fn load_serialized_kmers(
     let mut reader = BufReader::new(bin_kmers_file);
 
     processor.ref_kmers = decode_from_std_read(&mut reader, config::standard())?;
-
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
-    if !processor.ref_kmers[0].binary_search(&size_metadata).is_ok() {
+    if !processor.ref_kmers[0][0] == size_metadata {
         processor.ref_kmers.clear();
         return Err(format!(
             "k-mers are of different length than specified k ({})",
@@ -221,16 +228,10 @@ fn get_reference_kmers(
         })
         .collect();
 
-    for kmer_id_idx in &processor.ref_kmers {
-        for kmer in kmer_id_idx {
-            let bloom_pos = kmer & processor.bloom_mask;
-            processor.bloom_filter[(bloom_pos / 64) as usize] |= 1 << (bloom_pos % 64);
-        }
-    }
-
     Ok(())
 }
 
+// Delegate single thread to parse ref file and send read sequences
 fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
     let path = path.to_string();
 
@@ -244,6 +245,7 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
     });
 }
 
+/// Delegate read sequences to be processed by worker threads
 fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<Vec<u64>> {
     let mut ref_kmer_idx = vec![Vec::<u64>::new(); 4096];
 
@@ -256,13 +258,30 @@ fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<V
 
 /// Save k-mer index to binary file for faster loading later
 fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let bin_file = File::create(path)?;
+    let mut bin_writer = BufWriter::new(bin_file);
 
-    encode_into_std_write(&processor.ref_kmers, &mut writer, config::standard())?;
+    encode_into_std_write(&processor.ref_kmers, &mut bin_writer, config::standard())?;
 
     println!("Saved binary-encoded k-mers to index file: {}", path);
     Ok(())
+}
+
+/// Fill bloom filter with kmers from main index & add metadata
+fn fill_bloom_filter(processor: &mut KmerProcessor) {
+    for kmer_id_idx in &processor.ref_kmers {
+        for kmer in kmer_id_idx {
+            let bloom_pos = kmer & processor.bloom_mask;
+            processor.bloom_filter[(bloom_pos / 64) as usize] |= 1 << (bloom_pos % 64);
+        }
+    }
+
+    if !processor.bloom_filter.is_empty() {
+        processor.bloom_mask = (processor.bloom_filter.len() as u64 * 64) - 1;
+    }
+
+    let metadata = u64::MAX ^ processor.k as u64;
+    processor.ref_kmers[0].insert(0, metadata);
 }
 
 #[derive(PartialEq, Clone, Copy, Default)]
