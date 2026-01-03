@@ -124,11 +124,10 @@ This project is licensed under the MIT License, see [LICENSE](LICENSE) for detai
 - [Needletail](https://github.com/onecodex/needletail) — FASTA/FASTQ file parsing and bitkmer operations
 - [Bincode](https://sr.ht/~stygianentity/bincode/) — K-mer hashset serialization/deserialization
 - [Rayon](https://github.com/rayon-rs/rayon) — Multithreading
-- [Rustc-Hash](https://github.com/rust-lang/rustc-hash) — FxHashset for k-mer operations
 - [Clap](https://github.com/clap-rs/clap) — CLI
 - [Num-Cpus](https://github.com/seanmonstar/num_cpus) — detection of available threads
 - [Sysinfo](https://github.com/GuillaumeGomez/sysinfo) — system memory information
-- [Bytesize](https://github.com/tailhook/bytesize) — human-readable memory limit parsing
+- [Crossbeam](https://github.com/crossbeam-rs/crossbeam) — asynchronous channels
 
 ---
 
