@@ -30,11 +30,10 @@ Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bb
 
 **Memory Limit**:  
 - Specify maximum memory usage with `--maxmem <String>` (e.g., `5G` for 5 gigabytes, `500M` for 500 megabytes)  
-- Defaults to using 85% of available system memory
 
 **Automatic Reference Indexing**:  
 - Builds a serialized reference k-mer index using Bincode if `--binref <file>` is provided from references provided with `--ref <file>`
-- Uses saved index on subsequent runs if `--binref <file>` points to a serialized hashset of k-mers
+- Uses saved index on subsequent runs if `--binref <file>` is included
 
 ---
 
