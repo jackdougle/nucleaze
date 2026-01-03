@@ -16,9 +16,8 @@ pub struct KmerProcessor {
 
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool, bloom_size: usize) -> Self {
-        let kmer_id_length = min(12, k * 2); // sort with up to first six bases
+        let kmer_id_length = min(12, k * 2); // Sort with up to first six bases
         let num_partitions = 1 << kmer_id_length;
-        println!("KmerProcessor w/ k: {} and canonical use: {}", k, use_canonical);
 
         KmerProcessor {
             k,
@@ -48,14 +47,11 @@ impl KmerProcessor {
 
                 if valid_bases >= self.k {
                     let kmer_to_store = if self.use_canonical {
-                        let canonical = canonical((kmer, self.k as u8)).0.0;
-                        println!("{}", canonical);
-                        canonical
+                        canonical((kmer, self.k as u8)).0.0
                     } else {
                         kmer
                     };
 
-                    println!("{}", kmer_to_store);
                     let sid = self.map_kmer(&kmer_to_store);
                     kmer_index[sid].push(kmer_to_store);
                 }
@@ -90,8 +86,7 @@ impl KmerProcessor {
 
                     if valid_bases >= self.k {
                         let is_hit = if self.use_canonical {
-                            let canonical_kmer = std::cmp::min(kmer, rc_kmer);
-                            self.contains_kmer(&canonical_kmer)
+                            self.contains_kmer(&min(kmer, rc_kmer))
                         } else {
                             self.contains_kmer(&kmer)
                         };
@@ -116,7 +111,12 @@ impl KmerProcessor {
     }
 
     #[inline(always)]
-    /// Checks kmer index for kmer presence
+    pub fn num_kmers(&self) -> usize {
+        self.ref_kmers.iter().map(|v| v.len()).sum()
+    }
+
+    #[inline(always)]
+    /// Checks reference index for k-mer presence
     fn contains_kmer(&self, kmer: &u64) -> bool {
         // O(1) Bloom filter query
         let bloom_pos = kmer & self.bloom_mask;
@@ -131,6 +131,23 @@ impl KmerProcessor {
     #[inline(always)]
     fn map_kmer(&self, kmer: &u64) -> usize {
         (kmer >> (2 * self.k - self.kmer_id_length)) as usize
+    }
+
+    /// Fill bloom filter with kmers from main index & insert metadata
+    pub fn fill_bloom_filter(&mut self) {
+        for kmer_id_idx in &self.ref_kmers {
+            for kmer in kmer_id_idx {
+                let bloom_pos = kmer & self.bloom_mask;
+                self.bloom_filter[(bloom_pos / 64) as usize] |= 1 << (bloom_pos % 64);
+            }
+        }
+
+        if !self.bloom_filter.is_empty() {
+            self.bloom_mask = (self.bloom_filter.len() as u64 * 64) - 1;
+        }
+
+        let metadata = u64::MAX ^ self.k as u64;
+        self.ref_kmers[0].insert(0, metadata);
     }
 }
 
@@ -160,9 +177,8 @@ fn encode(b: u8) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::kmer_ops::*;
+    use super::*;
     use rand::Rng;
-    use std::cmp::min;
 
     // Helpers that use `encode` (which returns Option<u64>) so tests
     // compute forward and reverse-compliment encodings via `encode`.
@@ -189,9 +205,18 @@ mod tests {
         f: F,
     ) -> R {
         let mut kmer_index = processor.ref_kmers.clone();
-        let res = f(processor, &mut kmer_index);
+        let result = f(processor, &mut kmer_index);
+
+        // Sort and deduplicate each subindex
+        for subindex in &mut kmer_index {
+            subindex.sort_unstable();
+            subindex.dedup();
+        }
+
         processor.ref_kmers = kmer_index;
-        res
+        processor.fill_bloom_filter();
+
+        result
     }
     // KMER ENCODING TESTS
 
@@ -369,7 +394,7 @@ mod tests {
         let processor = KmerProcessor::new(21, 1, true, 1024);
         assert_eq!(processor.k, 21);
         assert_eq!(processor.threshold, 1);
-        assert!(processor.ref_kmers.is_empty());
+        assert_eq!(processor.ref_kmers.len(), 4096);
         assert_eq!(processor.bit_cap, (1u64 << 42) - 1);
     }
 
@@ -386,18 +411,14 @@ mod tests {
     #[test]
     fn test_single_sequence() {
         let mut processor = KmerProcessor::new(5, 1, true, 1024);
-        let ref_seq = b"ACGTACGT";
+        let ref_seq = b"ATCGCGGA";
 
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(ref_seq, k);
         });
 
-        // Should have metadata + k-mers
-        assert!(processor.ref_kmers.len() > 1);
-
-        // Verify metadata was inserted
-        let metadata = u64::MAX ^ 5;
-        assert!(processor.contains_kmer(&metadata));
+        println!("{}", processor.num_kmers());
+        assert!(processor.num_kmers() == 5); // 4 5-mers in 8 bp sequence + metadata
     }
 
     #[test]
@@ -418,23 +439,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Read sequence is shorter than k")]
-    fn test_process_short() {
-        let mut processor = KmerProcessor::new(10, 1, true, 1024);
-        with_kmer_index(&mut processor, |p, k| {
-            p.process_ref(b"ACGT", k); // Only 4 bases, k=10
-        });
-    }
-
-    #[test]
     fn test_rc_refs() {
-        let mut processor = KmerProcessor::new(3, 1, true, 1024);
+        let mut processor = KmerProcessor::new(4, 1, true, 1024);
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(b"TTTT", k); // original
-            p.process_ref(b"AAAA", k); // rc
         });
 
-        assert_eq!(processor.ref_kmers.len(), 2); // metadata + above k-mer
+        assert!(processor.process_read(b"AAAA"));
+        assert!(processor.process_read(b"TTTT"));
+        assert_eq!(processor.num_kmers(), 2);
     }
 
     // READ PROCESSING TESTS
@@ -514,7 +527,7 @@ mod tests {
     // SLIDING WINDOW TESTS
 
     #[test]
-    fn test_sliding_window_kmer_generation() {
+    fn test_kmer_rolling_hash() {
         let mut processor = KmerProcessor::new(3, 1, true, 1024);
 
         // For sequence "ACGTACGT" with k=3:
@@ -523,8 +536,6 @@ mod tests {
             p.process_ref(b"ACGTACGA", k);
         });
 
-        // Should have metadata + unique k-mers
-        println!("{:?}", &processor.ref_kmers);
         assert!(processor.ref_kmers.len() >= 4);
     }
 
@@ -649,7 +660,7 @@ mod tests {
             }
         });
 
-        assert!(processor.ref_kmers.len() == 5);
+        assert_eq!(processor.num_kmers(), 5); // 4 above variants + metadata
     }
 
     #[test]
@@ -669,7 +680,6 @@ mod tests {
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(&long_seq, k);
         });
-        println!("{}", &processor.ref_kmers.len());
         // Should have many k-mers
         assert!(processor.ref_kmers.len() > 500);
     }
@@ -677,15 +687,15 @@ mod tests {
     // METADATA TESTS
     #[test]
     fn test_metadata_insertion() {
-        let mut processor = KmerProcessor::new(15, 1, true, 1024);
-        assert!(processor.ref_kmers.is_empty());
-
+        let mut processor = KmerProcessor::new(16, 1, true, 1024);
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGTACGTACGT", k);
         });
 
-        let metadata = u64::MAX ^ 15;
-        assert!(processor.contains_kmer(&metadata));
+        let metadata = u64::MAX ^ 16;
+
+        assert_eq!(processor.num_kmers(), 2); // inserted 16-mer + metadata
+        assert!(processor.ref_kmers[0][0] == metadata);
     }
 
     #[test]
@@ -696,6 +706,7 @@ mod tests {
         with_kmer_index(&mut processor21, |p, k| {
             p.process_ref(b"ACGTACGTACGTACGTACGTACGT", k);
         });
+
         with_kmer_index(&mut processor15, |p, k| {
             p.process_ref(b"ACGTACGTACGTACGT", k);
         });
@@ -703,8 +714,8 @@ mod tests {
         let metadata21 = u64::MAX ^ 21;
         let metadata15 = u64::MAX ^ 15;
 
-        assert!(processor21.contains_kmer(&metadata21));
-        assert!(processor15.contains_kmer(&metadata15));
+        assert!(processor21.ref_kmers[0][0] == metadata21);
+        assert!(processor15.ref_kmers[0][0] == metadata15);
         assert_ne!(metadata21, metadata15);
     }
 
@@ -730,7 +741,7 @@ mod tests {
             let mut processor = KmerProcessor::new(*k, 1, true, 1024);
 
             // Create sequence long enough for this k
-            let seq: Vec<u8> = (0..*k + 10)
+            let seq: Vec<u8> = (0..*k)
                 .map(|i| match i % 4 {
                     0 => b'A',
                     1 => b'C',
@@ -742,7 +753,8 @@ mod tests {
             with_kmer_index(&mut processor, |p, k| {
                 p.process_ref(&seq, k);
             });
-            assert!(processor.ref_kmers.len() > 1); // Should have metadata + kmers
+
+            assert!(processor.num_kmers() > 1); // 1 k-mer + metadata for k-mer of length k
         }
     }
 
@@ -755,8 +767,8 @@ mod tests {
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(seq, k);
         });
-        // Should have metadata + 1 k-mer
-        assert_eq!(processor.ref_kmers.len(), 2);
+
+        assert_eq!(processor.num_kmers(), 2); // Inserted 10-mer + metadata
     }
 
     #[test]
@@ -767,7 +779,7 @@ mod tests {
         with_kmer_index(&mut processor, |p, k| {
             p.process_ref(seq, k);
         });
-        // Should have metadata + 2 k-mers
-        assert_eq!(processor.ref_kmers.len(), 3);
+
+        assert_eq!(processor.num_kmers(), 3); // Inserted 10-mers + metadata
     }
 }

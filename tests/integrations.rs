@@ -1,9 +1,10 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use tempfile::TempDir;
+use bincode::{config, decode_from_std_read};
 
 // --- Helper Functions ---
 
@@ -513,6 +514,64 @@ fn test_duplicate_file_args_error() {
         .arg(&p)
         .arg("--ref")
         .arg(&p)
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_metadata_kmer_present() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+    let saveref_path = temp.path().join("index.bin");
+
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGT")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "ACGTACGTACGT", "IIIIIIIIIIII")]).unwrap();
+
+    let k = 5;
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg(&k.to_string())
+        .arg("--saveref")
+        .arg(&saveref_path)
+        .assert()
+        .success();
+
+    let f = File::open(&saveref_path).unwrap();
+    let mut reader = BufReader::new(f);
+    let ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard()).unwrap();
+    let expected_meta = u64::MAX ^ k as u64;
+    assert_eq!(ref_kmers[0][0], expected_meta);
+}
+
+#[test]
+fn test_ref_with_short_seqs_errors() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+
+    // Reference sequences shorter than k (k=10)
+    create_fasta(&ref_path, &[("short1", "ACGT")]).unwrap();
+    create_fastq(&reads_path, &[("r1", "ACGT", "IIII")]).unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--k")
+        .arg("10")
         .assert()
         .failure();
 }

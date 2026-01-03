@@ -34,7 +34,7 @@ Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bb
 
 **Automatic Reference Indexing**:  
 - Builds a serialized reference k-mer index using Bincode if `--binref <file>` is provided from references provided with `--ref <file>`
-- Uses saved index on subsequent runs if `--binref <file>` points to a serialized hashset of kmers
+- Uses saved index on subsequent runs if `--binref <file>` points to a serialized hashset of k-mers
 
 ---
 

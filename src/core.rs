@@ -76,24 +76,23 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     // Try loading pre-built k-mer index, otherwise build from scratch
     match deserialize_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
-            let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|vec| vec.len()).sum();
             println!(
-                "\nLoaded {} k-mers from {}",
-                (total_kmers - 1),
+                "\nLoaded {} k-mer(s) from {}",
+                (kmer_processor.num_kmers()),
                 bin_kmers_path
             );
 
-            fill_bloom_filter(&mut kmer_processor);
+            kmer_processor.fill_bloom_filter();
         }
         Err(e) => {
             eprintln!("\nInvalid serialized reference file: {}", e);
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-                    let total_kmers: usize = kmer_processor.ref_kmers.iter().map(|v| v.len()).sum(); // includes metadata
-                    println!("Added {} from {}", (total_kmers - 1), ref_path,);
 
-                    fill_bloom_filter(&mut kmer_processor);
+                    println!("Added {} k-mer(s) from {}", (kmer_processor.num_kmers()), ref_path,);
+
+                    kmer_processor.fill_bloom_filter();
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
@@ -213,8 +212,6 @@ fn get_reference_kmers(
         .map(|_| spawn_worker(receiver.clone(), processor.clone()))
         .collect();
 
-    eprintln!("Extraction complete. Merging thread kmer indices...");
-
     processor.ref_kmers = (0..KMER_PARTITIONS)
         .into_par_iter()
         .map(|kmer_id| {
@@ -228,6 +225,10 @@ fn get_reference_kmers(
         })
         .collect();
 
+    if processor.num_kmers() == 0 {
+        return Err(format!("Reference file(s) contained no usable k-mers").into());
+    }
+    
     Ok(())
 }
 
@@ -267,31 +268,14 @@ fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<
     Ok(())
 }
 
-/// Fill bloom filter with kmers from main index & add metadata
-fn fill_bloom_filter(processor: &mut KmerProcessor) {
-    for kmer_id_idx in &processor.ref_kmers {
-        for kmer in kmer_id_idx {
-            let bloom_pos = kmer & processor.bloom_mask;
-            processor.bloom_filter[(bloom_pos / 64) as usize] |= 1 << (bloom_pos % 64);
-        }
-    }
-
-    if !processor.bloom_filter.is_empty() {
-        processor.bloom_mask = (processor.bloom_filter.len() as u64 * 64) - 1;
-    }
-
-    let metadata = u64::MAX ^ processor.k as u64;
-    processor.ref_kmers[0].insert(0, metadata);
-}
-
 #[derive(PartialEq, Clone, Copy, Default)]
 enum ProcessMode {
     #[default]
-    Unpaired, // single-end reads
-    Paired,           // paired-end in two files, output to two files
-    PairedInInterOut, // paired-end in two files, interleaved output
-    InterInPairedOut, // interleaved input, paired-end output
-    Interleaved,      // interleaved input and output
+    Unpaired,         // Single-end reads
+    Paired,           // Paired-end in two files, output to two files
+    PairedInInterOut, // Paired-end in two files, interleaved output
+    InterInPairedOut, // Interleaved input, paired-end output
+    Interleaved,      // Interleaved input and output
 }
 
 /// Determine input/output mode based on file arguments
@@ -340,7 +324,6 @@ fn detect_mode(
 }
 
 /// Process reads from input file(s), filter by k-mer matches, and write to output file(s)
-/// Returns (matched_count, matched_bases, unmatched_count, unmatched_bases)
 fn process_reads(
     reads_path: String,
     reads2_path: String,
