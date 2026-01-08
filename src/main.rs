@@ -3,6 +3,7 @@ mod kmer_ops;
 
 use clap::Parser;
 use rlimit::{Resource, setrlimit};
+use std::env;
 use std::io;
 use std::time::Instant;
 
@@ -147,7 +148,7 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
 
     let version = env!("CARGO_PKG_VERSION");
-    let user_args: Vec<String> = std::env::args().skip(1).collect();
+    let user_args: Vec<String> = env::args().skip(1).collect();
     println!("Nucleaze {} [{}]", version, user_args.join(" "));
 
     if let Some(maxmem_str) = &args.maxmem {

@@ -89,8 +89,11 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
 
             match get_reference_kmers(&ref_path, &mut kmer_processor) {
                 Ok(()) => {
-
-                    println!("Added {} k-mer(s) from {}", (kmer_processor.num_kmers()), ref_path,);
+                    println!(
+                        "Added {} k-mer(s) from {}",
+                        (kmer_processor.num_kmers()),
+                        ref_path,
+                    );
 
                     kmer_processor.fill_bloom_filter();
                 }
@@ -199,8 +202,7 @@ fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
-    const KMER_ID_LENGTH: usize = 12;
-    const KMER_PARTITIONS: usize = 1 << KMER_ID_LENGTH; // 4096 shards
+    let num_partitions: usize = 1 << processor.kmer_id_length;
 
     let (sender, receiver) = bounded::<Vec<u8>>(8);
 
@@ -209,10 +211,10 @@ fn get_reference_kmers(
     let num_worker_threads = num_cpus::get_physical();
     let kmer_idx: Vec<Vec<Vec<u64>>> = (0..num_worker_threads)
         .into_par_iter()
-        .map(|_| spawn_worker(receiver.clone(), processor.clone()))
+        .map(|_| spawn_worker(receiver.clone(), processor.clone(), num_partitions))
         .collect();
 
-    processor.ref_kmers = (0..KMER_PARTITIONS)
+    processor.ref_kmers = (0..num_partitions)
         .into_par_iter()
         .map(|kmer_id| {
             let mut merged_idx = Vec::new();
@@ -228,7 +230,7 @@ fn get_reference_kmers(
     if processor.num_kmers() == 0 {
         return Err(format!("Reference file(s) contained no usable k-mers").into());
     }
-    
+
     Ok(())
 }
 
@@ -240,15 +242,19 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
         let mut reader = parse_fastx_file(&path).expect("FASTA open failed");
 
         while let Some(record) = reader.next() {
-            let seqrec = record.expect("FASTA parse error");
-            sender.send(seqrec.seq().to_vec()).unwrap();
+            let record = record.expect("FASTA parse error");
+            sender.send(record.seq().to_vec()).unwrap();
         }
     });
 }
 
 /// Delegate read sequences to be processed by worker threads
-fn spawn_worker(receiver: XReceiver<Vec<u8>>, processor: KmerProcessor) -> Vec<Vec<u64>> {
-    let mut ref_kmer_idx = vec![Vec::<u64>::new(); 4096];
+fn spawn_worker(
+    receiver: XReceiver<Vec<u8>>,
+    processor: KmerProcessor,
+    num_partitions: usize,
+) -> Vec<Vec<u64>> {
+    let mut ref_kmer_idx = vec![Vec::<u64>::new(); num_partitions];
 
     while let Ok(seq) = receiver.recv() {
         processor.process_ref(&seq, &mut ref_kmer_idx);
@@ -271,7 +277,7 @@ fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<
 #[derive(PartialEq, Clone, Copy, Default)]
 enum ProcessMode {
     #[default]
-    Unpaired,         // Single-end reads
+    Unpaired, // Single-end reads
     Paired,           // Paired-end in two files, output to two files
     PairedInInterOut, // Paired-end in two files, interleaved output
     InterInPairedOut, // Interleaved input, paired-end output

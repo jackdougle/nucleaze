@@ -16,7 +16,7 @@ pub struct KmerProcessor {
 
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool, bloom_size: usize) -> Self {
-        let kmer_id_length = min(12, k * 2); // Sort with up to first six bases
+        let kmer_id_length = min(18, k * 2); // Sort with up to first six bases
         let num_partitions = 1 << kmer_id_length;
 
         KmerProcessor {
@@ -68,9 +68,9 @@ impl KmerProcessor {
             return false;
         }
 
-        let mut hits: u8 = 0;
-        let mut kmer = 0u64;
-        let mut rc_kmer = 0u64;
+        let mut hits = 0;
+        let mut kmer = 0;
+        let mut rc_kmer = 0;
         let mut valid_bases = 0;
 
         for &base in seq {
@@ -153,7 +153,7 @@ impl KmerProcessor {
 
 #[inline(always)]
 /// Encodes UTF8 bases to 2 bits
-fn encode(b: u8) -> Option<u64> {
+pub fn encode(b: u8) -> Option<u64> {
     const INVALID: u8 = 0xFF;
     // A=00, C=01, G=10, T/U=11
     static BASE_TABLE: [u8; 256] = {
