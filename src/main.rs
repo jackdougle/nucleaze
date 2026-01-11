@@ -62,10 +62,7 @@ MEMORY & PERFORMANCE PARAMETERS
                         sequence ID.
     --canonical         (-c) K-mers are stored and compared in canonical form 
                         (lowest of forward and reverse-complement).
-    --bloomsize 16M     (-f) Memory size of Bloom filter in human-readable
-                        format. '-l 64M' delegates 64 MB of memory to the Bloom
-                        filter. 16 Mb by default.
-
+                        
 Function and usage documentation at /README.md.
 Contact jack.gdouglass@gmail.com for any questions or issues encountered.
 ";
@@ -136,10 +133,6 @@ struct Args {
     /// Enabling flag uses canonical k-mers for comparison
     #[arg(short, long)]
     canonical: bool,
-
-    /// Size of Bloom filter in human-readable format
-    #[arg(short = 'f', long)]
-    bloomsize: Option<String>,
 }
 
 fn main() -> io::Result<()> {

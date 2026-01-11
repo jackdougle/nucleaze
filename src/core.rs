@@ -1,21 +1,21 @@
-//! I/O and processing operations for filtering read sequences based reference kmers
-
-use crate::{kmer_ops::KmerProcessor, parse_memory_size};
+use crate::kmer_ops::KmerProcessor;
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use crossbeam::channel::{Receiver as XReceiver, Sender, bounded};
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::sync::Arc;
+use std::mem::replace;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::spawn;
 use std::time::Instant;
 use std::{fs, io, u32};
-use std::{thread, usize};
 
 /// A chunk of sequences with their match results
 #[derive(Eq, PartialEq)]
@@ -69,9 +69,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     }
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
-    let bloom_size = parse_memory_size(&args.bloomsize.unwrap_or("16M".to_string())).unwrap();
-
-    let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical, bloom_size as usize);
+    let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical);
 
     // Try loading pre-built k-mer index, otherwise build from scratch
     match deserialize_kmers(bin_kmers_path, &mut kmer_processor) {
@@ -81,21 +79,19 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 (kmer_processor.num_kmers()),
                 bin_kmers_path
             );
-
-            kmer_processor.fill_bloom_filter();
         }
         Err(e) => {
-            eprintln!("\nInvalid serialized reference file: {}", e);
+            if !bin_kmers_path.is_empty() {
+                eprintln!("\nInvalid serialized reference file: {}", e);
+            }
 
-            match get_reference_kmers(&ref_path, &mut kmer_processor) {
+            match get_reference_kmers(&ref_path, &mut kmer_processor, num_threads) {
                 Ok(()) => {
                     println!(
                         "Added {} k-mer(s) from {}",
                         (kmer_processor.num_kmers()),
                         ref_path,
                     );
-
-                    kmer_processor.fill_bloom_filter();
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
@@ -103,9 +99,13 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 }
             };
 
-            match serialize_kmers(&new_bin_kmers_path, &mut kmer_processor) {
-                Ok(()) => println!("Saved serialized k-mers to {}", new_bin_kmers_path),
-                Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
+            if !new_bin_kmers_path.is_empty() {
+                match serialize_kmers(&new_bin_kmers_path, &mut kmer_processor) {
+                    Ok(()) => println!("Saved serialized k-mers to {}", new_bin_kmers_path),
+                    Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
+                }
+            } else {
+                println!("K-mer index not serialized")
             }
         }
     }
@@ -113,6 +113,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     let indexing_time = start_time.elapsed().as_secs_f32();
     println!("Indexing time:\t\t{:.3} seconds\n", indexing_time);
 
+    let kmer_processor = Arc::new(kmer_processor);
     let process_mode = detect_mode(&args.in2, &args.outm2, &args.outu2, args.interinput);
 
     let in_path = args.r#in;
@@ -142,20 +143,35 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
     ) {
         Ok((mseq_count, mbase_count, useq_count, ubase_count)) => {
             let read_count = mseq_count + useq_count;
-            let matched_percent = (mseq_count as f32 / read_count as f32) * 100.0;
-            let unmatched_percent = (useq_count as f32 / read_count as f32) * 100.0;
+            let matched_percent = if read_count > 0 {
+                (mseq_count as f32 / read_count as f32) * 100.0
+            } else {
+                0.0
+            };
+            let unmatched_percent = if read_count > 0 {
+                (useq_count as f32 / read_count as f32) * 100.0
+            } else {
+                0.0
+            };
 
             let base_count = mbase_count + ubase_count;
-            let mbase_percent = (mbase_count as f32 / base_count as f32) * 100.0;
-            let ubase_percent = (ubase_count as f32 / base_count as f32) * 100.0;
+            let mbase_percent = if base_count > 0 {
+                (mbase_count as f32 / base_count as f32) * 100.0
+            } else {
+                0.0
+            };
+            let ubase_percent = if base_count > 0 {
+                (ubase_count as f32 / base_count as f32) * 100.0
+            } else {
+                0.0
+            };
 
             let end_time = start_time.elapsed().as_secs_f32();
             println!("Processing time:\t{:.3} seconds", end_time - indexing_time);
 
             println!(
                 "\nInput:\t\t\t{} reads         \t{} bases",
-                read_count,
-                mbase_count + ubase_count
+                read_count, base_count
             );
             println!(
                 "Matches:\t\t{} reads ({:.2}%) \t{} bases ({:.2}%)",
@@ -167,7 +183,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
             );
         }
         Err(e) => {
-            eprintln!("\nError processing reads:\n{}", e);
+            eprintln!("\nError processing read sequences: {}", e);
         }
     }
 
@@ -185,7 +201,7 @@ fn deserialize_kmers(
     processor.ref_kmers = decode_from_std_read(&mut reader, config::standard())?;
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
-    if !processor.ref_kmers[0][0] == size_metadata {
+    if !processor.ref_kmers[0].contains(&size_metadata) {
         processor.ref_kmers.clear();
         return Err(format!(
             "k-mers are of different length than specified k ({})",
@@ -201,51 +217,59 @@ fn deserialize_kmers(
 fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
+    num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    let num_partitions: usize = 1 << processor.kmer_id_length;
+    if fs::metadata(ref_path)?.len() == 0 {
+        return Err("reference file is empty".into());
+    }
 
-    let (sender, receiver) = bounded::<Vec<u8>>(8);
+    let num_idx: usize = processor.ref_kmers.len();
 
-    spawn_reader(ref_path, sender);
+    let (sender, receiver) = bounded::<Vec<u8>>(16);
 
-    let num_worker_threads = num_cpus::get_physical();
-    let kmer_idx: Vec<Vec<Vec<u64>>> = (0..num_worker_threads)
+    spawn_reader(ref_path, sender).expect("k-mer extraction failed");
+
+    let kmer_idx: Vec<Vec<FxHashSet<u64>>> = (0..num_threads)
         .into_par_iter()
-        .map(|_| spawn_worker(receiver.clone(), processor.clone(), num_partitions))
+        .map(|_| spawn_worker(receiver.clone(), processor.clone(), num_idx))
         .collect();
 
-    processor.ref_kmers = (0..num_partitions)
+    processor.ref_kmers = (0..num_idx)
         .into_par_iter()
         .map(|kmer_id| {
-            let mut merged_idx = Vec::new();
+            let mut merged_idx = FxHashSet::default();
             for thread_kmer_idx in &kmer_idx {
-                merged_idx.extend_from_slice(&thread_kmer_idx[kmer_id]);
+                merged_idx.extend(&thread_kmer_idx[kmer_id]);
             }
-            merged_idx.sort_unstable();
-            merged_idx.dedup();
             merged_idx
         })
         .collect();
 
     if processor.num_kmers() == 0 {
-        return Err(format!("Reference file(s) contained no usable k-mers").into());
+        return Err(format!("reference file(s) contained no usable k-mers").into());
     }
 
     Ok(())
 }
 
 // Delegate single thread to parse ref file and send read sequences
-fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) {
+fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error>> {
     let path = path.to_string();
 
-    std::thread::spawn(move || {
+    spawn(move || {
         let mut reader = parse_fastx_file(&path).expect("FASTA open failed");
 
         while let Some(record) = reader.next() {
-            let record = record.expect("FASTA parse error");
+            let record = match record {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
             sender.send(record.seq().to_vec()).unwrap();
         }
     });
+
+    Ok(())
 }
 
 /// Delegate read sequences to be processed by worker threads
@@ -253,8 +277,8 @@ fn spawn_worker(
     receiver: XReceiver<Vec<u8>>,
     processor: KmerProcessor,
     num_partitions: usize,
-) -> Vec<Vec<u64>> {
-    let mut ref_kmer_idx = vec![Vec::<u64>::new(); num_partitions];
+) -> Vec<FxHashSet<u64>> {
+    let mut ref_kmer_idx = vec![FxHashSet::<u64>::default(); num_partitions];
 
     while let Ok(seq) = receiver.recv() {
         processor.process_ref(&seq, &mut ref_kmer_idx);
@@ -333,7 +357,7 @@ fn detect_mode(
 fn process_reads(
     reads_path: String,
     reads2_path: String,
-    processor: KmerProcessor,
+    processor: Arc<KmerProcessor>,
     matched_path: &str,
     unmatched_path: &str,
     matched2_path: &str,
@@ -341,6 +365,10 @@ fn process_reads(
     process_mode: ProcessMode,
     ordered_output: bool,
 ) -> Result<(u32, u32, u32, u32), Box<dyn Error + Send + Sync>> {
+    if fs::metadata(&reads_path)?.len() == 0 {
+        return Err("reads file is empty".into());
+    }
+
     let processor = Arc::new(processor);
 
     // Channel for passing chunks from reader thread to writer
@@ -365,7 +393,7 @@ fn process_reads(
     let parellel_chunk_pos = chunk_pos.clone();
 
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
-    let worker_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+    let worker_thread = spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut reader = if reads_path == "stdin" || reads_path.starts_with("stdin.") {
             needletail::parse_fastx_reader(io::stdin())
         } else {
@@ -438,7 +466,10 @@ fn process_reads(
             || process_mode == ProcessMode::InterInPairedOut
         {
             while let Some(record) = reader.next() {
-                let record = record?;
+                let record = match record {
+                    Ok(r) => r,
+                    Err(_) => return Err("no usable reads found".into()),
+                };
                 push_record(
                     record.id(),
                     &record.seq(),
@@ -449,10 +480,8 @@ fn process_reads(
 
                 if offsets.len() == CHUNK_SIZE {
                     // Double buffering: swap buffers and dispatch filled one
-                    let local_arena =
-                        std::mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                    let local_offsets =
-                        std::mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                    let local_arena = replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                    let local_offsets = replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
                     process_arena(local_arena, local_offsets);
                 }
             }
@@ -479,10 +508,8 @@ fn process_reads(
                 );
 
                 if offsets.len() == CHUNK_SIZE {
-                    let local_arena =
-                        std::mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                    let local_offsets =
-                        std::mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                    let local_arena = replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                    let local_offsets = replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
                     process_arena(local_arena, local_offsets);
                 }
             }
