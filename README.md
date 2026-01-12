@@ -2,7 +2,7 @@
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/jackdougle/nucleaze/rust.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE) 
 
-# **<img src="./public/ferris.png" width="40em" style="display: block; margin: auto;" alt="🦀" /> Nucleaze 🧬**
+# **Nucleaze 🧬**
 A high-performance Rust tool for filtering DNA/RNA reads based on a set of reference k-mers.
 Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bbtools/bb-tools-user-guide/bbduk-guide/) by Brian Bushnell. Provides performant and memory-efficient read processing with support for both paired and unpaired FASTA/FASTQ files, with multiple files or in interleaved format.  
 

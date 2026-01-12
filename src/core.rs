@@ -7,15 +7,16 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::fs::{File, metadata, remove_file};
+use std::io::{BufReader, BufWriter, Write, Result as IOResult, stdin};
 use std::mem::replace;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Instant;
-use std::{fs, io, u32};
+use std::process::exit;
+use std::str::from_utf8_unchecked;
 
 /// A chunk of sequences with their match results
 #[derive(Eq, PartialEq)]
@@ -40,7 +41,7 @@ impl PartialOrd for SequenceChunk {
 }
 
 /// Processing reads against a reference k-mer index
-pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
+pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     let available_threads = num_cpus::get();
     let num_threads = args
         .threads
@@ -65,7 +66,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
         eprintln!(
             "Error: Please provide either a reference file (--ref) or a serialized k-mer index file (--binref)."
         );
-        std::process::exit(1);
+        exit(1);
     }
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
@@ -95,7 +96,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("\nError loading reference sequences: {}", e);
-                    std::process::exit(1);
+                    exit(1);
                 }
             };
 
@@ -221,7 +222,7 @@ fn get_reference_kmers(
     processor: &mut KmerProcessor,
     num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if fs::metadata(&ref_path)?.len() == 0 {
+    if metadata(&ref_path)?.len() == 0 {
         return Err("reference file is empty".into());
     }
 
@@ -241,12 +242,11 @@ fn get_reference_kmers(
             processor.process_ref(&seq, &mut local_idx);
 
             for(i, idx) in local_idx.iter_mut().enumerate() {
-                if !idx.is_empty() { merged_idx[i].lock().unwrap().append(idx); }
+                if !idx.is_empty() {
+                    idx.dedup(); 
+                    merged_idx[i].lock().unwrap().append(idx); 
+                }
             }
-        }
-
-        for(i, idx) in local_idx.iter_mut().enumerate() {
-            if !idx.is_empty() { merged_idx[i].lock().unwrap().append(idx); }
         }
     });
 
@@ -363,7 +363,7 @@ fn process_reads(
     process_mode: ProcessMode,
     ordered_output: bool,
 ) -> Result<(u32, u32, u32, u32), Box<dyn Error + Send + Sync>> {
-    if fs::metadata(&reads_path)?.len() == 0 {
+    if metadata(&reads_path)?.len() == 0 {
         return Err("reads file is empty".into());
     }
 
@@ -393,7 +393,7 @@ fn process_reads(
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
     let worker_thread = spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut reader = if reads_path == "stdin" || reads_path.starts_with("stdin.") {
-            needletail::parse_fastx_reader(io::stdin())
+            needletail::parse_fastx_reader(stdin())
         } else {
             needletail::parse_fastx_file(&reads_path)
         }?;
@@ -739,7 +739,7 @@ fn process_reads(
         unmatched2_path,
     ] {
         if path.starts_with("stdout") {
-            let _ = fs::remove_file(path);
+            let _ = remove_file(path);
         }
     }
 
@@ -762,13 +762,13 @@ fn write_read(
 ) -> Result<(), Box<dyn Send + Sync + Error>> {
     if stdout {
         unsafe {
-            let id = std::str::from_utf8_unchecked(id);
-            let seq = std::str::from_utf8_unchecked(sequence);
+            let id = from_utf8_unchecked(id);
+            let seq = from_utf8_unchecked(sequence);
 
             if format == "fa" || format == "fna" || format == "fasta" {
                 println!(">{}\n{}", id, seq);
             } else {
-                let qual = std::str::from_utf8_unchecked(quality);
+                let qual = from_utf8_unchecked(quality);
                 println!("@{}\n{}\n+\n{}", id, seq, qual);
             }
         }
