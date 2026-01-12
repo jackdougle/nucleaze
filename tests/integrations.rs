@@ -319,38 +319,6 @@ fn test_serialized_reference_persistence() {
     );
 }
 
-#[test]
-fn test_bloom_filter_configuration() {
-    // Tests that the new --bloomsize argument is accepted and functional
-    let temp = TempDir::new().unwrap();
-    let ref_path = temp.path().join("ref.fa");
-    let reads_path = temp.path().join("reads.fq");
-    let matched_path = temp.path().join("matched.fq");
-    let unmatched_path = temp.path().join("unmatched.fq");
-
-    create_fasta(&ref_path, &[("ref", "ACGTACGT")]).unwrap();
-    create_fastq(&reads_path, &[("r1", "ACGTACGT", "IIIIIIII")]).unwrap();
-
-    nucleaze_cmd()
-        .arg("--in")
-        .arg(&reads_path)
-        .arg("--ref")
-        .arg(&ref_path)
-        .arg("--outm")
-        .arg(&matched_path)
-        .arg("--outu")
-        .arg(&unmatched_path)
-        .arg("--k")
-        .arg("8")
-        .arg("--bloomsize")
-        .arg("4M") // Explicitly set bloom size
-        .assert()
-        .success();
-
-    let matched = fs::read_to_string(&matched_path).unwrap();
-    assert!(matched.contains("r1"));
-}
-
 // --- Parameter Validation Tests ---
 
 #[test]
@@ -514,7 +482,7 @@ fn test_duplicate_file_args_error() {
 }
 
 #[test]
-fn test_metadata_kmer_present() {
+fn test_metadata_kmer_functional() {
     let temp = TempDir::new().unwrap();
     let ref_path = temp.path().join("ref.fa");
     let reads_path = temp.path().join("reads.fq");
@@ -525,7 +493,7 @@ fn test_metadata_kmer_present() {
     create_fasta(&ref_path, &[("ref1", "ACGTACGTACGT")]).unwrap();
     create_fastq(&reads_path, &[("r1", "ACGTACGTACGT", "IIIIIIIIIIII")]).unwrap();
 
-    let k = 5;
+    let k: i32 = 5;
 
     nucleaze_cmd()
         .arg("--in")
@@ -545,9 +513,27 @@ fn test_metadata_kmer_present() {
 
     let f = File::open(&saveref_path).unwrap();
     let mut reader = BufReader::new(f);
-    let ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard()).unwrap();
-    let expected_meta = u64::MAX ^ k as u64;
-    assert_eq!(ref_kmers[0][0], expected_meta);
+
+    let ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding()).unwrap();
+
+    let size_metadata = u64::MAX ^ k as u64;
+    assert!(ref_kmers[0].contains(&size_metadata));
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("6".to_string()) // metadata is set for k = 5
+        .arg("--binref")
+        .arg(&saveref_path)
+        .assert()
+        .failure(); 
 }
 
 #[test]

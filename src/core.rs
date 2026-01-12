@@ -1,9 +1,9 @@
+//! I/O for reference indexing and read processing operations using k-mers
 use crate::kmer_ops::KmerProcessor;
 use bincode::{config, decode_from_std_read, encode_into_std_write};
-use crossbeam::channel::{Receiver as XReceiver, Sender, bounded};
+use crossbeam::channel::{Sender, bounded};
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
@@ -76,7 +76,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
         Ok(()) => {
             println!(
                 "\nLoaded {} k-mer(s) from {}",
-                (kmer_processor.num_kmers()),
+                kmer_processor.num_kmers() - 1, // do not count metadata
                 bin_kmers_path
             );
         }
@@ -89,7 +89,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> io::Result<()> {
                 Ok(()) => {
                     println!(
                         "Added {} k-mer(s) from {}",
-                        (kmer_processor.num_kmers()),
+                        kmer_processor.num_kmers() - 1, // do not count metadata
                         ref_path,
                     );
                 }
@@ -198,7 +198,9 @@ fn deserialize_kmers(
     let bin_kmers_file = File::open(bin_kmers_path)?;
     let mut reader = BufReader::new(bin_kmers_file);
 
-    processor.ref_kmers = decode_from_std_read(&mut reader, config::standard())?;
+    let raw_ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding())?;
+    processor.add_serializable_kmers(raw_ref_kmers);
+
     // Verify k-mer length matches by checking metadata
     let size_metadata = u64::MAX ^ processor.k as u64;
     if !processor.ref_kmers[0].contains(&size_metadata) {
@@ -219,35 +221,47 @@ fn get_reference_kmers(
     processor: &mut KmerProcessor,
     num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if fs::metadata(ref_path)?.len() == 0 {
+    if fs::metadata(&ref_path)?.len() == 0 {
         return Err("reference file is empty".into());
     }
 
     let num_idx: usize = processor.ref_kmers.len();
+    let merged_idx: Arc<Vec<Mutex<Vec<u64>>>> = Arc::new(
+        (0..num_idx).map(|_| Mutex::new(Vec::new())).collect()
+    );
 
     let (sender, receiver) = bounded::<Vec<u8>>(16);
 
     spawn_reader(ref_path, sender).expect("k-mer extraction failed");
 
-    let kmer_idx: Vec<Vec<FxHashSet<u64>>> = (0..num_threads)
-        .into_par_iter()
-        .map(|_| spawn_worker(receiver.clone(), processor.clone(), num_idx))
-        .collect();
+    (0..num_threads).into_par_iter().for_each(|_| {
+        let mut local_idx = vec![Vec::with_capacity(128); num_idx];
 
-    processor.ref_kmers = (0..num_idx)
-        .into_par_iter()
-        .map(|kmer_id| {
-            let mut merged_idx = FxHashSet::default();
-            for thread_kmer_idx in &kmer_idx {
-                merged_idx.extend(&thread_kmer_idx[kmer_id]);
+        while let Ok(seq) = receiver.recv() {
+            processor.process_ref(&seq, &mut local_idx);
+
+            for(i, idx) in local_idx.iter_mut().enumerate() {
+                if !idx.is_empty() { merged_idx[i].lock().unwrap().append(idx); }
             }
-            merged_idx
-        })
-        .collect();
+        }
+
+        for(i, idx) in local_idx.iter_mut().enumerate() {
+            if !idx.is_empty() { merged_idx[i].lock().unwrap().append(idx); }
+        }
+    });
+
+    processor.ref_kmers.par_iter_mut().enumerate().for_each(|(i, final_idx)| {
+        let vec_idx = merged_idx[i].lock().unwrap();
+        for &kmer in vec_idx.iter() {
+            final_idx.insert(kmer);
+        }
+    });
 
     if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());
     }
+
+    processor.ref_kmers[0].insert(u64::MAX ^ processor.k as u64); // insert metadata
 
     Ok(())
 }
@@ -272,29 +286,13 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-/// Delegate read sequences to be processed by worker threads
-fn spawn_worker(
-    receiver: XReceiver<Vec<u8>>,
-    processor: KmerProcessor,
-    num_partitions: usize,
-) -> Vec<FxHashSet<u64>> {
-    let mut ref_kmer_idx = vec![FxHashSet::<u64>::default(); num_partitions];
-
-    while let Ok(seq) = receiver.recv() {
-        processor.process_ref(&seq, &mut ref_kmer_idx);
-    }
-
-    ref_kmer_idx
-}
-
 /// Save k-mer index to binary file for faster loading later
 fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
     let bin_file = File::create(path)?;
     let mut bin_writer = BufWriter::new(bin_file);
 
-    encode_into_std_write(&processor.ref_kmers, &mut bin_writer, config::standard())?;
+    encode_into_std_write(&processor.to_serializable(), &mut bin_writer, config::standard().with_fixed_int_encoding())?;
 
-    println!("Saved binary-encoded k-mers to index file: {}", path);
     Ok(())
 }
 
