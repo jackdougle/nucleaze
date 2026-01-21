@@ -19,11 +19,11 @@ Nucleaze compares DNA sequences from input file to DNA sequences from reference
  will be printed as a match. Very memory-efficient and performant. Processes
  paired reads in two files or as a single interleaved file.
 
-USAGE: nucleaze --in <reads file> --ref <ref file> ...
+USAGE: nucleaze --ref <ref file> [--in <reads file>] ...
 
 INPUT PARAMETERS
     --in <file>         Input FASTA/FASTQ file containing reads to be filtered.
-                        Use 'stdin.fq' or 'stdin' to pipe from stdin.
+                        Defaults to stdin if not specified.
     --in2 <file>        Second input file for 2nd pair of reads. 
                         Must be same length as main input file.
     --ref <file>        (-r) Reference FASTA/FASTQ file containing sequences to
@@ -91,9 +91,9 @@ struct Args {
     #[arg(short, long)]
     r#ref: Option<String>,
 
-    /// FASTA/FASTQ path for read sequences
+    /// FASTA/FASTQ path for read sequences (defaults to stdin)
     #[arg(long)]
-    r#in: String,
+    r#in: Option<String>,
 
     /// FASTA/FASTQ path for 2nd pair of reads
     #[arg(long)]
@@ -197,8 +197,8 @@ fn parse_memory_size(input: &str) -> Result<u64, String> {
 /// Validate command-line arguments to catch common errors early
 fn validate_args(args: &Args) -> io::Result<()> {
     // Prevent using same file for both inputs
-    if let Some(ref in2) = args.in2 {
-        if args.r#in == *in2 {
+    if let (Some(in1), Some(in2)) = (&args.r#in, &args.in2) {
+        if in1 == in2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "both inputs (--in and --in2) cannot be the same file",
