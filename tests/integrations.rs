@@ -1013,3 +1013,30 @@ fn test_threads_argument() {
     .assert()
     .success();
 }
+
+#[test]
+fn test_stdin_input() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let outm = temp.path().join("m.fq");
+    let outu = temp.path().join("u.fq");
+
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")]).unwrap();
+    let stdin_data = "@read1\nACGTACGTACGTACGTACGTA\n+\nIIIIIIIIIIIIIIIIIIIII\n";
+
+    // Test stdin default (no --in)
+    nucleaze_cmd()
+        .args(["--ref", ref_path.to_str().unwrap(), "--outm", outm.to_str().unwrap(), "--outu", outu.to_str().unwrap()])
+        .write_stdin(stdin_data)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reads from stdin"));
+
+    // Test explicit --in -
+    nucleaze_cmd()
+        .args(["--in", "-", "--ref", ref_path.to_str().unwrap(), "--outm", outm.to_str().unwrap(), "--outu", outu.to_str().unwrap()])
+        .write_stdin(stdin_data)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reads from stdin"));
+}

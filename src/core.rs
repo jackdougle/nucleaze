@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::error::Error;
+use std::fmt;
 use std::fs::{File, metadata, remove_file};
 use std::io::{BufReader, BufWriter, Write, Result as IOResult, stdin};
 use std::mem::replace;
@@ -17,6 +18,21 @@ use std::thread::spawn;
 use std::time::Instant;
 use std::process::exit;
 use std::str::from_utf8_unchecked;
+
+/// Source of input reads - either a file path or stdin
+pub enum InputSource {
+    File(String),
+    Stdin,
+}
+
+impl fmt::Display for InputSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InputSource::File(path) => write!(f, "{}", path),
+            InputSource::Stdin => write!(f, "stdin"),
+        }
+    }
+}
 
 /// A chunk of sequences with their match results
 #[derive(Eq, PartialEq)]
@@ -117,7 +133,10 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     let kmer_processor = Arc::new(kmer_processor);
     let process_mode = detect_mode(&args.in2, &args.outm2, &args.outu2, args.interinput);
 
-    let in_path = args.r#in;
+    let input = match args.r#in.as_deref() {
+        None | Some("-") => InputSource::Stdin,
+        Some(path) => InputSource::File(path.to_string()),
+    };
     let in2_path = args.in2.unwrap_or_default();
 
     let outm_path = args.outm.unwrap_or(String::from("/dev/null"));
@@ -128,11 +147,11 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
 
     println!(
         "Using {} threads to process reads from {}",
-        num_threads, in_path
+        num_threads, input
     );
 
     match process_reads(
-        in_path,
+        input,
         in2_path,
         kmer_processor,
         &outm_path,
@@ -353,7 +372,7 @@ fn detect_mode(
 
 /// Process reads from input file(s), filter by k-mer matches, and write to output file(s)
 fn process_reads(
-    reads_path: String,
+    input: InputSource,
     reads2_path: String,
     processor: Arc<KmerProcessor>,
     matched_path: &str,
@@ -363,8 +382,10 @@ fn process_reads(
     process_mode: ProcessMode,
     ordered_output: bool,
 ) -> Result<(u32, u32, u32, u32), Box<dyn Error + Send + Sync>> {
-    if metadata(&reads_path)?.len() == 0 {
-        return Err("reads file is empty".into());
+    if let InputSource::File(ref path) = input {
+        if metadata(path)?.len() == 0 {
+            return Err("reads file is empty".into());
+        }
     }
 
     let processor = Arc::new(processor);
@@ -392,10 +413,9 @@ fn process_reads(
 
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
     let worker_thread = spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut reader = if reads_path == "stdin" || reads_path.starts_with("stdin.") {
-            needletail::parse_fastx_reader(stdin())
-        } else {
-            needletail::parse_fastx_file(&reads_path)
+        let mut reader = match input {
+            InputSource::Stdin => needletail::parse_fastx_reader(stdin()),
+            InputSource::File(ref path) => needletail::parse_fastx_file(path),
         }?;
 
         const CHUNK_SIZE: usize = 10_000;

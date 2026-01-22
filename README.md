@@ -15,9 +15,9 @@ Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bb
 - If a read sequence has at least x k-mers also found in reference dataset, it is a match
   - x is 1 by default, changed with `--minhits <int>`
 
-**Piping**:  
-- Use `--in stdin` to pipe from stdin
-- use `--outm`/`outu`/`outm2`/`outu2` `stdout.fa`/`stdout.fq` to pipe results to stdout
+**Piping**:
+- Reads from stdin by default (or use `--in -` explicitly)
+- Use `--outm`/`--outu`/`--outm2`/`--outu2` `stdout.fa`/`stdout.fq` to pipe results to stdout
 
 **Paired reads support**:  
 - Paired inputs and outputs can be specified by adding more input/output files
@@ -55,7 +55,7 @@ brew install nucleaze
 ```
 
 ### **3. Run program with necessary arguments**
-Nucleaze requires `--in` and at least one of `--ref` or `--binref` to be provided.
+Nucleaze requires at least one of `--ref` or `--binref` to be provided. Input defaults to stdin if `--in` is not specified.
 
 See more parameter documentation at **[./src/main.rs](/src/main.rs)**
 
