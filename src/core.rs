@@ -128,7 +128,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
                     Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
                 }
             } else {
-                println!("K-mer index not serialized")
+                println!("\nK-mer index not serialized")
             }
         }
     }
@@ -264,7 +264,7 @@ fn get_reference_kmers(
     spawn_reader(ref_path, sender).expect("k-mer extraction failed");
 
     (0..num_threads).into_par_iter().for_each(|_| {
-        let mut local_idx = vec![Vec::with_capacity(128); num_idx];
+        let mut local_idx = vec![Vec::with_capacity(64); num_idx];
 
         while let Ok(seq) = receiver.recv() {
             processor.process_ref(&seq, &mut local_idx);
@@ -320,20 +320,6 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error
 
     Ok(())
 }
-
-// fn transfer_chunks(chunks: &mut Vec<Vec<u64>>, merged_idx: &Vec<Mutex<FxHashSet<u64>>>) {
-//     for (i, chunk) in chunks.iter_mut().enumerate() {
-//         if !chunk.is_empty() {
-//             chunk.sort_unstable();
-//             chunk.dedup();
-
-//             let mut subidx = merged_idx[i].lock().unwrap();
-//             subidx.extend(chunk.iter());
-
-//             chunk.clear();
-//         }
-//     }
-// }
 
 /// Save k-mer index to binary file for faster loading later
 fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
