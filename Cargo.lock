@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "nucleaze"
-version = "1.4.1-alpha"
+version = "1.4.1"
 dependencies = [
  "assert_cmd",
  "bincode",
