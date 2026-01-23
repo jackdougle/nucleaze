@@ -1,23 +1,29 @@
 //! I/O for reference indexing and read processing operations using k-mers
 use crate::kmer_ops::KmerProcessor;
+
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use crossbeam::channel::{Sender, bounded};
 use needletail::parse_fastx_file;
 use rayon::prelude::*;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::error::Error;
-use std::fmt;
-use std::fs::{File, metadata, remove_file};
-use std::io::{BufReader, BufWriter, Write, Result as IOResult, stdin};
-use std::mem::replace;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
-use std::thread::spawn;
-use std::time::Instant;
-use std::process::exit;
-use std::str::from_utf8_unchecked;
+use rustc_hash::FxHashSet;
+use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
+    error::Error,
+    fmt,
+    fs::{File, metadata, remove_file},
+    io::{BufReader, BufWriter, Result as IOResult, Write, stdin},
+    mem,
+    process::exit,
+    str::from_utf8_unchecked,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    thread,
+    time::Instant,
+};
 
 /// Source of input reads - either a file path or stdin
 pub enum InputSource {
@@ -218,7 +224,8 @@ fn deserialize_kmers(
     let bin_kmers_file = File::open(bin_kmers_path)?;
     let mut reader = BufReader::new(bin_kmers_file);
 
-    let raw_ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding())?;
+    let raw_ref_kmers: Vec<Vec<u64>> =
+        decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding())?;
     processor.add_serializable_kmers(raw_ref_kmers);
 
     // Verify k-mer length matches by checking metadata
@@ -246,8 +253,10 @@ fn get_reference_kmers(
     }
 
     let num_idx: usize = processor.ref_kmers.len();
-    let merged_idx: Arc<Vec<Mutex<Vec<u64>>>> = Arc::new(
-        (0..num_idx).map(|_| Mutex::new(Vec::new())).collect()
+    let merged_idx: Arc<Vec<Mutex<FxHashSet<u64>>>> = Arc::new(
+        (0..num_idx)
+            .map(|_| Mutex::new(FxHashSet::default()))
+            .collect(),
     );
 
     let (sender, receiver) = bounded::<Vec<u8>>(16);
@@ -260,21 +269,28 @@ fn get_reference_kmers(
         while let Ok(seq) = receiver.recv() {
             processor.process_ref(&seq, &mut local_idx);
 
-            for(i, idx) in local_idx.iter_mut().enumerate() {
-                if !idx.is_empty() {
-                    idx.dedup(); 
-                    merged_idx[i].lock().unwrap().append(idx); 
+            for (i, local_subidx) in local_idx.iter_mut().enumerate() {
+                if !local_subidx.is_empty() {
+                    let mut merged_subidx = merged_idx[i].lock().unwrap();
+
+                    for &kmer in local_subidx.iter() {
+                        merged_subidx.insert(kmer);
+                    }
+
+                    local_subidx.clear();
                 }
             }
         }
     });
 
-    processor.ref_kmers.par_iter_mut().enumerate().for_each(|(i, final_idx)| {
-        let vec_idx = merged_idx[i].lock().unwrap();
-        for &kmer in vec_idx.iter() {
-            final_idx.insert(kmer);
-        }
-    });
+    processor
+        .ref_kmers
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(i, final_subidx)| {
+            let mut guard = merged_idx[i].lock().unwrap();
+            mem::swap(final_subidx, &mut *guard);
+        });
 
     if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());
@@ -289,7 +305,7 @@ fn get_reference_kmers(
 fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error>> {
     let path = path.to_string();
 
-    spawn(move || {
+    thread::spawn(move || {
         let mut reader = parse_fastx_file(&path).expect("FASTA open failed");
 
         while let Some(record) = reader.next() {
@@ -305,12 +321,30 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+// fn transfer_chunks(chunks: &mut Vec<Vec<u64>>, merged_idx: &Vec<Mutex<FxHashSet<u64>>>) {
+//     for (i, chunk) in chunks.iter_mut().enumerate() {
+//         if !chunk.is_empty() {
+//             chunk.sort_unstable();
+//             chunk.dedup();
+
+//             let mut subidx = merged_idx[i].lock().unwrap();
+//             subidx.extend(chunk.iter());
+
+//             chunk.clear();
+//         }
+//     }
+// }
+
 /// Save k-mer index to binary file for faster loading later
 fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
     let bin_file = File::create(path)?;
     let mut bin_writer = BufWriter::new(bin_file);
 
-    encode_into_std_write(&processor.to_serializable(), &mut bin_writer, config::standard().with_fixed_int_encoding())?;
+    encode_into_std_write(
+        &processor.to_serializable(),
+        &mut bin_writer,
+        config::standard().with_fixed_int_encoding(),
+    )?;
 
     Ok(())
 }
@@ -412,7 +446,7 @@ fn process_reads(
     let parellel_chunk_pos = chunk_pos.clone();
 
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
-    let worker_thread = spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+    let worker_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut reader = match input {
             InputSource::Stdin => needletail::parse_fastx_reader(stdin()),
             InputSource::File(ref path) => needletail::parse_fastx_file(path),
@@ -498,8 +532,8 @@ fn process_reads(
 
                 if offsets.len() == CHUNK_SIZE {
                     // Double buffering: swap buffers and dispatch filled one
-                    let local_arena = replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                    let local_offsets = replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                    let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                    let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
                     process_arena(local_arena, local_offsets);
                 }
             }
@@ -526,8 +560,8 @@ fn process_reads(
                 );
 
                 if offsets.len() == CHUNK_SIZE {
-                    let local_arena = replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                    let local_offsets = replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                    let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                    let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
                     process_arena(local_arena, local_offsets);
                 }
             }

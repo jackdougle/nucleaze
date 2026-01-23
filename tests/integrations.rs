@@ -514,7 +514,8 @@ fn test_metadata_kmer_functional() {
     let f = File::open(&saveref_path).unwrap();
     let mut reader = BufReader::new(f);
 
-    let ref_kmers: Vec<Vec<u64>> = decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding()).unwrap();
+    let ref_kmers: Vec<Vec<u64>> =
+        decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding()).unwrap();
 
     let size_metadata = u64::MAX ^ k as u64;
     assert!(ref_kmers[0].contains(&size_metadata));
@@ -533,7 +534,7 @@ fn test_metadata_kmer_functional() {
         .arg("--binref")
         .arg(&saveref_path)
         .assert()
-        .failure(); 
+        .failure();
 }
 
 #[test]
@@ -1026,7 +1027,14 @@ fn test_stdin_input() {
 
     // Test stdin default (no --in)
     nucleaze_cmd()
-        .args(["--ref", ref_path.to_str().unwrap(), "--outm", outm.to_str().unwrap(), "--outu", outu.to_str().unwrap()])
+        .args([
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--outm",
+            outm.to_str().unwrap(),
+            "--outu",
+            outu.to_str().unwrap(),
+        ])
         .write_stdin(stdin_data)
         .assert()
         .success()
@@ -1034,7 +1042,16 @@ fn test_stdin_input() {
 
     // Test explicit --in -
     nucleaze_cmd()
-        .args(["--in", "-", "--ref", ref_path.to_str().unwrap(), "--outm", outm.to_str().unwrap(), "--outu", outu.to_str().unwrap()])
+        .args([
+            "--in",
+            "-",
+            "--ref",
+            ref_path.to_str().unwrap(),
+            "--outm",
+            outm.to_str().unwrap(),
+            "--outu",
+            outu.to_str().unwrap(),
+        ])
         .write_stdin(stdin_data)
         .assert()
         .success()
