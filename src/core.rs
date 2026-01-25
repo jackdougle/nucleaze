@@ -527,10 +527,6 @@ fn process_reads(
             // Paired modes: read from two files simultaneously
             let mut reader2 = parse_fastx_file(&reads2_path)?;
 
-            // Track extra reads from mismatched file lengths
-            let mut extra_r1 = 0usize;
-            let mut extra_r2 = 0usize;
-
             loop {
                 let rec1 = reader.next();
                 let rec2 = reader2.next();
@@ -562,32 +558,21 @@ fn process_reads(
                         }
                     }
                     (Some(_), None) => {
-                        // File 1 has more reads than file 2
-                        extra_r1 = 1;
-                        while reader.next().is_some() {
-                            extra_r1 += 1;
-                        }
+                        eprintln!(
+                            "Warning: --in has more reads than --in2. \
+                             Processing stopped at the end of the shorter file."
+                        );
                         break;
                     }
                     (None, Some(_)) => {
-                        // File 2 has more reads than file 1
-                        extra_r2 = 1;
-                        while reader2.next().is_some() {
-                            extra_r2 += 1;
-                        }
+                        eprintln!(
+                            "Warning: --in2 has more reads than --in. \
+                             Processing stopped at the end of the shorter file."
+                        );
                         break;
                     }
                     (None, None) => break,
                 }
-            }
-
-            if extra_r1 > 0 || extra_r2 > 0 {
-                eprintln!(
-                    "Warning: Paired input files have different lengths. \
-                     {} extra read(s) in --in, {} extra read(s) in --in2. \
-                     Processing stopped at the shorter file.",
-                    extra_r1, extra_r2
-                );
             }
         }
 
@@ -675,7 +660,7 @@ fn process_reads(
             let reads_to_process = if num_reads % 2 != 0 {
                 // Odd number of reads in paired/interleaved mode - skip the last unpaired read
                 eprintln!(
-                    "Warning: Odd number of reads ({}) in paired/interleaved mode. \
+                    "Warning: Odd number of reads ({}) in interleaved pairs mode. \
                      The last unpaired read will be skipped.",
                     num_reads
                 );
