@@ -141,7 +141,7 @@ fn main() -> io::Result<()> {
 
     let version = env!("CARGO_PKG_VERSION");
     let user_args: Vec<String> = env::args().skip(1).collect();
-    println!("Nucleaze {} [{}]", version, user_args.join(" "));
+    println!("Nucleaze v{} [{}]\n", version, user_args.join(" "));
 
     if let Some(maxmem_str) = &args.maxmem {
         match parse_memory_size(maxmem_str) {

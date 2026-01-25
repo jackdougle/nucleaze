@@ -85,9 +85,14 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     let ref_path = args.r#ref.unwrap_or_default();
     let bin_kmers_path = &args.binref.unwrap_or_default();
     if ref_path.is_empty() && bin_kmers_path.is_empty() {
-        eprintln!(
-            "Error: Please provide either a reference file (--ref) or a serialized k-mer index file (--binref)."
-        );
+        if args.r#in.is_none() {
+            eprintln!(
+                "\nPlease provide essential arguments: --in <reads> and --ref/--binref <references>"
+            );
+            exit(1);
+        }
+
+        eprintln!("\nPlease provide reference path (--ref or --binref)");
         exit(1);
     }
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
@@ -98,14 +103,14 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     match deserialize_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
             println!(
-                "\nLoaded {} k-mer(s) from {}",
+                "Loaded {} k-mer(s) from {}",
                 kmer_processor.num_kmers() - 1, // do not count metadata
                 bin_kmers_path
             );
         }
         Err(e) => {
             if !bin_kmers_path.is_empty() {
-                eprintln!("\nInvalid serialized reference file: {}", e);
+                eprintln!("Invalid serialized reference file: {}", e);
             }
 
             match get_reference_kmers(&ref_path, &mut kmer_processor, num_threads) {
@@ -117,7 +122,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
                     );
                 }
                 Err(e) => {
-                    eprintln!("\nError loading reference sequences: {}", e);
+                    eprintln!("Error loading reference sequences: {}", e);
                     exit(1);
                 }
             };
@@ -128,7 +133,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
                     Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
                 }
             } else {
-                println!("\nK-mer index not serialized")
+                println!("K-mer index not serialized")
             }
         }
     }
