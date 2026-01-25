@@ -18,7 +18,7 @@ use std::{
     str::from_utf8_unchecked,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering as AtomicOrdering},
+        atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread,
@@ -248,7 +248,8 @@ fn get_reference_kmers(
     processor: &mut KmerProcessor,
     num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if metadata(&ref_path)?.len() == 0 {
+    let ref_meta = metadata(&ref_path)?;
+    if ref_meta.is_file() && ref_meta.len() == 0 {
         return Err("reference file is empty".into());
     }
 
@@ -401,9 +402,10 @@ fn process_reads(
     unmatched2_path: &str,
     process_mode: ProcessMode,
     ordered_output: bool,
-) -> Result<(u32, u32, u32, u32), Box<dyn Error + Send + Sync>> {
+) -> Result<(u64, u64, u64, u64), Box<dyn Error + Send + Sync>> {
     if let InputSource::File(ref path) = input {
-        if metadata(path)?.len() == 0 {
+        let meta = metadata(path)?;
+        if meta.is_file() && meta.len() == 0 {
             return Err("reads file is empty".into());
         }
     }
@@ -526,29 +528,52 @@ fn process_reads(
         } else {
             // Paired modes: read from two files simultaneously
             let mut reader2 = parse_fastx_file(&reads2_path)?;
-            while let (Some(record1), Some(record2)) = (reader.next(), reader2.next()) {
-                let record1 = record1?;
-                let record2 = record2?;
 
-                push_record(
-                    record1.id(),
-                    &record1.seq(),
-                    record1.qual().unwrap_or(b""),
-                    &mut arena,
-                    &mut offsets,
-                );
-                push_record(
-                    record2.id(),
-                    &record2.seq(),
-                    record2.qual().unwrap_or(b""),
-                    &mut arena,
-                    &mut offsets,
-                );
+            loop {
+                let rec1 = reader.next();
+                let rec2 = reader2.next();
 
-                if offsets.len() == CHUNK_SIZE {
-                    let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                    let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
-                    process_arena(local_arena, local_offsets);
+                match (rec1, rec2) {
+                    (Some(r1), Some(r2)) => {
+                        let record1 = r1?;
+                        let record2 = r2?;
+
+                        push_record(
+                            record1.id(),
+                            &record1.seq(),
+                            record1.qual().unwrap_or(b""),
+                            &mut arena,
+                            &mut offsets,
+                        );
+                        push_record(
+                            record2.id(),
+                            &record2.seq(),
+                            record2.qual().unwrap_or(b""),
+                            &mut arena,
+                            &mut offsets,
+                        );
+
+                        if offsets.len() == CHUNK_SIZE {
+                            let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                            let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                            process_arena(local_arena, local_offsets);
+                        }
+                    }
+                    (Some(_), None) => {
+                        eprintln!(
+                            "Warning: --in has more reads than --in2. \
+                             Processing stopped at the end of the shorter file."
+                        );
+                        break;
+                    }
+                    (None, Some(_)) => {
+                        eprintln!(
+                            "Warning: --in2 has more reads than --in. \
+                             Processing stopped at the end of the shorter file."
+                        );
+                        break;
+                    }
+                    (None, None) => break,
                 }
             }
         }
@@ -582,10 +607,10 @@ fn process_reads(
             None
         };
 
-    let matched_count = Arc::new(AtomicU32::new(0));
-    let matched_bases = Arc::new(AtomicU32::new(0));
-    let unmatched_count = Arc::new(AtomicU32::new(0));
-    let unmatched_bases = Arc::new(AtomicU32::new(0));
+    let matched_count = Arc::new(AtomicU64::new(0));
+    let matched_bases = Arc::new(AtomicU64::new(0));
+    let unmatched_count = Arc::new(AtomicU64::new(0));
+    let unmatched_bases = Arc::new(AtomicU64::new(0));
 
     // Write a SequenceChunk to disk, reconstructing reads from the arena
     let mut chunk_output = |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
@@ -616,7 +641,7 @@ fn process_reads(
                         matched_stdout,
                     )?;
                     matched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                    matched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
+                    matched_bases.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
                 } else {
                     write_read(
                         &mut unmatched_writer,
@@ -627,13 +652,25 @@ fn process_reads(
                         unmatched_stdout,
                     )?;
                     unmatched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                    unmatched_bases.fetch_add(seq.len() as u32, AtomicOrdering::Relaxed);
+                    unmatched_bases.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
                 }
             }
         } else {
             // Paired-end: process reads in pairs (stride 2)
             // If either read matches, both are written to matched output
-            for i in (0..offsets.len()).step_by(2) {
+            let num_reads = offsets.len();
+            let reads_to_process = if num_reads % 2 != 0 {
+                // Odd number of reads in paired/interleaved mode - skip the last unpaired read
+                eprintln!(
+                    "Warning: Odd number of reads ({}) in interleaved pairs mode. \
+                     The last unpaired read will be skipped.",
+                    num_reads
+                );
+                num_reads - 1
+            } else {
+                num_reads
+            };
+            for i in (0..reads_to_process).step_by(2) {
                 let has_match = matches[i] || matches[i + 1];
                 let (id1, seq1, qual1) = get_read(i);
                 let (id2, seq2, qual2) = get_read(i + 1);
@@ -708,7 +745,7 @@ fn process_reads(
                 }
 
                 count.fetch_add(2, AtomicOrdering::Relaxed);
-                bases.fetch_add((seq1.len() + seq2.len()) as u32, AtomicOrdering::Relaxed);
+                bases.fetch_add((seq1.len() + seq2.len()) as u64, AtomicOrdering::Relaxed);
             }
         }
         Ok(())

@@ -194,6 +194,26 @@ fn parse_memory_size(input: &str) -> Result<u64, String> {
 
 /// Validate command-line arguments to catch common errors early
 fn validate_args(args: &Args) -> io::Result<()> {
+    // Validate k-mer size (must fit in 64-bit encoding: 32 bases * 2 bits = 64 bits)
+    if let Some(k) = args.k {
+        if k > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "k-mer size {} is too large. Maximum supported k-mer size is 32 \
+                     (k-mers are encoded as 64-bit integers using 2 bits per base).",
+                    k
+                ),
+            ));
+        }
+        if k == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "k-mer size must be at least 1",
+            ));
+        }
+    }
+
     // Prevent using same file for both inputs
     if let (Some(in1), Some(in2)) = (&args.r#in, &args.in2) {
         if in1 == in2 {
