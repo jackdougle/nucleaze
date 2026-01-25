@@ -1,6 +1,6 @@
 [package]
 name = "nucleaze"
-version = "1.4.1"
+version = "1.4.2-dev"
 edition = "2024"
 description = "Read filtering using k-mers."
 license = "MIT"
