@@ -248,7 +248,8 @@ fn get_reference_kmers(
     processor: &mut KmerProcessor,
     num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if metadata(&ref_path)?.len() == 0 {
+    let ref_meta = metadata(&ref_path)?;
+    if ref_meta.is_file() && ref_meta.len() == 0 {
         return Err("reference file is empty".into());
     }
 
@@ -403,7 +404,8 @@ fn process_reads(
     ordered_output: bool,
 ) -> Result<(u64, u64, u64, u64), Box<dyn Error + Send + Sync>> {
     if let InputSource::File(ref path) = input {
-        if metadata(path)?.len() == 0 {
+        let meta = metadata(path)?;
+        if meta.is_file() && meta.len() == 0 {
             return Err("reads file is empty".into());
         }
     }
