@@ -161,7 +161,16 @@ fn main() -> io::Result<()> {
         }
     }
 
-    validate_args(&args)?;
+    match validate_args(&args) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("{}", e)
+        }
+    }
+
+    if validate_args(&args).is_err() {
+        std::process::exit(1)
+    }
 
     core::run(args, start_time)?;
 
@@ -173,11 +182,11 @@ fn parse_memory_size(input: &str) -> Result<u64, String> {
 
     // Split into (number, suffix)
     let (num_str, multiplier) = match s.strip_suffix('G') {
-        Some(n) => (n, 1024_u64.pow(3)),
+        Some(n) => (n, 1024u64.pow(3)),
         None => match s.strip_suffix('M') {
-            Some(n) => (n, 1024_u64.pow(2)),
+            Some(n) => (n, 1024u64.pow(2)),
             None => match s.strip_suffix('K') {
-                Some(n) => (n, 1024_u64),
+                Some(n) => (n, 1024u64),
                 None => match s.strip_suffix('B') {
                     Some(n) => (n, 1),
                     None => (s.as_str(), 1), // no unit
@@ -194,13 +203,28 @@ fn parse_memory_size(input: &str) -> Result<u64, String> {
 
 /// Validate command-line arguments to catch common errors early
 fn validate_args(args: &Args) -> io::Result<()> {
+    // Assert at least one of --ref or --binref is present
+    if args.r#ref.is_none() && args.binref.is_none() {
+        if args.r#in.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Please provide required arguments: --in <reads> and either --ref <refs.fastx> or --binref <refs.bin>",
+            ));
+        }
+
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Please provide reference path: --ref <refs.fastx> or --binref <refs.bin>",
+        ));
+    }
+
     // Validate k-mer size (must fit in 64-bit encoding: 32 bases * 2 bits = 64 bits)
     if let Some(k) = args.k {
         if k > 32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "k-mer size {} is too large. Maximum supported k-mer size is 32 \
+                    "Argument error: k-mer size {} is too large. Maximum supported k-mer size is 32 \
                      (k-mers are encoded as 64-bit integers using 2 bits per base).",
                     k
                 ),
@@ -209,7 +233,7 @@ fn validate_args(args: &Args) -> io::Result<()> {
         if k == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "k-mer size must be at least 1",
+                "Argument error: k-mer size must be at least 1",
             ));
         }
     }
@@ -219,7 +243,7 @@ fn validate_args(args: &Args) -> io::Result<()> {
         if in1 == in2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "both inputs (--in and --in2) cannot be the same file",
+                "Argument error: both inputs (--in and --in2) cannot be the same file",
             ));
         }
     }
@@ -229,7 +253,7 @@ fn validate_args(args: &Args) -> io::Result<()> {
         if outm == outu {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "matches (--outm) and non-matches (--outu) cannot have the same output path",
+                "Argument error: matches (--outm) and non-matches (--outu) cannot have the same output path",
             ));
         }
     }
@@ -239,7 +263,7 @@ fn validate_args(args: &Args) -> io::Result<()> {
         if outm2 == outu2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Matches (--outm2) and non-matches (--outu2) cannot have the same output path",
+                "Argument error: matches (--outm2) and non-matches (--outu2) cannot have the same output path",
             ));
         }
     }

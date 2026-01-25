@@ -84,17 +84,6 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
 
     let ref_path = args.r#ref.unwrap_or_default();
     let bin_kmers_path = &args.binref.unwrap_or_default();
-    if ref_path.is_empty() && bin_kmers_path.is_empty() {
-        if args.r#in.is_none() {
-            eprintln!(
-                "\nPlease provide essential arguments: --in <reads> and --ref/--binref <references>"
-            );
-            exit(1);
-        }
-
-        eprintln!("\nPlease provide reference path (--ref or --binref)");
-        exit(1);
-    }
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
     let mut kmer_processor = KmerProcessor::new(k, min_hits, use_canonical);
@@ -559,8 +548,10 @@ fn process_reads(
                         );
 
                         if offsets.len() == CHUNK_SIZE {
-                            let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
-                            let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
+                            let local_arena =
+                                mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
+                            let local_offsets =
+                                mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
                             process_arena(local_arena, local_offsets);
                         }
                     }
