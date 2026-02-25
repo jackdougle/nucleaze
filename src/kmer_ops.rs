@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::cmp::min;
 
-/// K-mer processor for building reference index and filtering reads
+/// K-mer encoding, storage, and sequence processing operations
 #[derive(Clone)]
 pub struct KmerProcessor {
     pub k: usize,
@@ -12,7 +12,7 @@ pub struct KmerProcessor {
     pub bit_cap: u64,
     pub use_canonical: bool,
     pub ref_kmers: Vec<FxHashSet<u64>>,
-    pub kmer_idx_mask: usize,
+    pub idx_mask: usize,
 }
 
 impl KmerProcessor {
@@ -24,7 +24,7 @@ impl KmerProcessor {
             threshold,
             use_canonical,
             ref_kmers: vec![FxHashSet::default(); num_idx],
-            kmer_idx_mask: num_idx - 1,
+            idx_mask: num_idx - 1,
             bit_cap: if k >= 32 {
                 u64::MAX
             } else {
@@ -33,17 +33,17 @@ impl KmerProcessor {
         }
     }
 
-    /// Build reference k-mer index from a sequence
-    pub fn process_ref(&self, seq: &[u8], kmer_index: &mut Vec<Vec<u64>>) {
+    /// Add k-mers from sequence to reference index.
+    pub fn process_ref(&self, seq: &[u8], idx: &mut Vec<Vec<u64>>) {
         let mut kmer = 0u64;
-        let mut valid_bases = 0usize;
+        let mut valid = 0usize;
 
         for &base in seq {
             if let Some(bits) = encode(base) {
                 kmer = ((kmer << 2) | bits) & self.bit_cap;
-                valid_bases += 1;
+                valid += 1;
 
-                if valid_bases >= self.k {
+                if valid >= self.k {
                     let final_kmer = if self.use_canonical {
                         canonical((kmer, self.k as u8)).0.0
                     } else {
@@ -51,16 +51,16 @@ impl KmerProcessor {
                     };
 
                     let sid = self.map_kmer(&final_kmer);
-                    kmer_index[sid].push(final_kmer);
+                    idx[sid].push(final_kmer);
                 }
             } else {
                 kmer = 0;
-                valid_bases = 0;
+                valid = 0;
             }
         }
     }
 
-    /// Check if a read has enough matching k-mers against the reference
+    /// Check if a read has enough matching k-mers against the reference.
     pub fn process_read(&self, seq: &[u8]) -> bool {
         if seq.len() < self.k {
             return false;
@@ -69,20 +69,20 @@ impl KmerProcessor {
         let mut hits = 0;
         let mut kmer = 0;
         let mut rc_kmer = 0;
-        let mut valid_bases = 0;
+        let mut valid = 0;
 
         for &base in seq {
             match encode(base) {
-                Some(encoded_base) => {
-                    kmer = ((kmer << 2) | encoded_base) & self.bit_cap;
+                Some(base) => {
+                    kmer = ((kmer << 2) | base) & self.bit_cap;
 
                     // Update rc kmer: (rc >> 2) | (complement << shift)
-                    let encoded_rc_base = encoded_base ^ 0b11; // Inverse of bits (A=00->T=11)
-                    rc_kmer = (rc_kmer >> 2) | (encoded_rc_base << (2 * (self.k - 1)));
+                    let rc_base = base ^ 0b11; // Inverse of bits (A -> T)
+                    rc_kmer = (rc_kmer >> 2) | (rc_base << (2 * (self.k - 1)));
 
-                    valid_bases += 1;
+                    valid += 1;
 
-                    if valid_bases >= self.k {
+                    if valid >= self.k {
                         let is_hit = if self.use_canonical {
                             self.contains_kmer(&min(kmer, rc_kmer))
                         } else {
@@ -98,7 +98,7 @@ impl KmerProcessor {
                     }
                 }
                 None => {
-                    valid_bases = 0;
+                    valid = 0;
                     kmer = 0;
                     rc_kmer = 0;
                 }
@@ -114,18 +114,20 @@ impl KmerProcessor {
     }
 
     #[inline(always)]
-    /// Checks reference index for k-mer presence
+    /// Checks reference index for presence of the k-mer.
     fn contains_kmer(&self, kmer: &u64) -> bool {
-        let kmer_idx = self.map_kmer(kmer);
-        unsafe { self.ref_kmers.get_unchecked(kmer_idx).contains(kmer) }
+        let idx = self.map_kmer(kmer);
+        unsafe { self.ref_kmers.get_unchecked(idx).contains(kmer) }
     }
 
     #[inline(always)]
+    /// Assign k-mer to shard.
     fn map_kmer(&self, kmer: &u64) -> usize {
         let kmer = kmer ^ (kmer >> 12); // Spread entropy
-        kmer as usize & self.kmer_idx_mask
+        kmer as usize & self.idx_mask
     }
 
+    /// Tranpose reference index to a serializable format.
     pub fn to_serializable(&self) -> Vec<Vec<u64>> {
         self.ref_kmers
             .iter()
@@ -133,6 +135,7 @@ impl KmerProcessor {
             .collect()
     }
 
+    /// Add serialized k-mers to reference index.
     pub fn add_serializable_kmers(&mut self, data: Vec<Vec<u64>>) {
         self.ref_kmers
             .par_iter_mut()
@@ -148,7 +151,7 @@ impl KmerProcessor {
 }
 
 #[inline(always)]
-/// Encodes UTF8 bases to 2 bits
+/// Encodes UTF8 bases to 2 bits.
 pub fn encode(b: u8) -> Option<u64> {
     // A=00, C=01, G=10, T/U=11
     static BASE_TABLE: [u8; 256] = {
@@ -173,7 +176,7 @@ pub fn encode(b: u8) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     // Helpers that use `encode` (which returns Option<u64>) so tests
     // compute forward and reverse-compliment encodings via `encode`.
@@ -195,7 +198,7 @@ mod tests {
 
     /// Helper to clone the processor's `ref_kmers`, run a mutation on it,
     /// then restore it back to the processor. Returns the closure result.
-    fn with_kmer_index<R, F: FnOnce(&mut KmerProcessor, &mut Vec<Vec<u64>>) -> R>(
+    fn with_idx<R, F: FnOnce(&mut KmerProcessor, &mut Vec<Vec<u64>>) -> R>(
         processor: &mut KmerProcessor,
         f: F,
     ) -> R {
@@ -408,7 +411,7 @@ mod tests {
         let mut processor = KmerProcessor::new(5, 1, true);
         let ref_seq = b"ATCGCGGA";
 
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(ref_seq, k);
         });
 
@@ -422,7 +425,7 @@ mod tests {
 
         let mut count1 = 0usize;
         let mut count2 = 0usize;
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
             count1 = k.len();
             p.process_ref(b"TGCATGCA", k);
@@ -436,7 +439,7 @@ mod tests {
     #[test]
     fn test_rc_refs() {
         let mut processor = KmerProcessor::new(4, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"TTTT", k); // original
         });
 
@@ -451,7 +454,7 @@ mod tests {
     fn test_process_read_exact_match() {
         let mut processor = KmerProcessor::new(5, 1, true);
         let ref_seq = b"ACGTACGT";
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(ref_seq, k);
         });
 
@@ -463,7 +466,7 @@ mod tests {
     #[test]
     fn test_process_read_no_match() {
         let mut processor = KmerProcessor::new(5, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
         });
         let read = b"TTTTTTTT";
@@ -473,7 +476,7 @@ mod tests {
     #[test]
     fn test_process_read_partial_match_below_threshold() {
         let mut processor = KmerProcessor::new(5, 3, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
         });
 
@@ -488,7 +491,7 @@ mod tests {
     #[test]
     fn test_process_read_meets_threshold() {
         let mut processor = KmerProcessor::new(4, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
         });
 
@@ -527,7 +530,7 @@ mod tests {
 
         // For sequence "ACGTACGT" with k=3:
         // k-mers should be: ACG, CGT, GTA, TAC, ACG, CGA
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGA", k);
         });
 
@@ -543,7 +546,7 @@ mod tests {
         // Process same sequence twice
         let mut count1 = 0usize;
         let mut count2 = 0usize;
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
             count1 = k.len();
             p.process_ref(b"ACGTACGT", k);
@@ -559,7 +562,7 @@ mod tests {
     #[test]
     fn test_threshold_one() {
         let mut processor = KmerProcessor::new(5, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGTACGT", k);
         });
 
@@ -571,7 +574,7 @@ mod tests {
     #[test]
     fn test_threshold_higher() {
         let mut processor = KmerProcessor::new(3, 3, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGTACGT", k);
         });
 
@@ -585,7 +588,7 @@ mod tests {
     #[test]
     fn test_minimum_k_value() {
         let mut processor = KmerProcessor::new(1, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ACGT", k);
         });
 
@@ -597,7 +600,7 @@ mod tests {
     fn test_sequence_exactly_k_length() {
         let mut processor = KmerProcessor::new(5, 1, true);
         let seq = b"ACGTA"; // Exactly k=5
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(seq, k);
         });
         assert!(processor.process_read(seq));
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     fn test_repeated_bases() {
         let mut processor = KmerProcessor::new(5, 1, true);
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"AAAAAAAAAA", k);
         });
 
@@ -630,7 +633,7 @@ mod tests {
         let mut processor = KmerProcessor::new(5, 1, true);
 
         // Add forward strand
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(b"ATGCCAGT", k);
         });
 
@@ -647,7 +650,7 @@ mod tests {
         let bases = ["A", "C", "G", "T"];
 
         // Add many reference sequences
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             for i in 0..100 {
                 let remainder = i % 4;
                 let seq = format!("ACGTACGTACGTACGTACGT{}", bases[remainder]);
@@ -672,7 +675,7 @@ mod tests {
             })
             .collect();
 
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(&long_seq, k);
         });
         // Should have many k-mers
@@ -684,7 +687,7 @@ mod tests {
     fn test_various_thresholds() {
         for threshold in 1..=5 {
             let mut processor = KmerProcessor::new(5, threshold, true);
-            with_kmer_index(&mut processor, |p, k| {
+            with_idx(&mut processor, |p, k| {
                 p.process_ref(b"ACGTACGTACGTACGT", k);
             });
 
@@ -710,7 +713,7 @@ mod tests {
                 })
                 .collect();
 
-            with_kmer_index(&mut processor, |p, k| {
+            with_idx(&mut processor, |p, k| {
                 p.process_ref(&seq, k);
             });
 
@@ -724,7 +727,7 @@ mod tests {
         let mut processor = KmerProcessor::new(10, 1, true);
         let seq = b"ACGTACGTAC"; // Exactly 10 bases
 
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(seq, k);
         });
 
@@ -736,7 +739,7 @@ mod tests {
         let mut processor = KmerProcessor::new(10, 1, true);
         let seq = b"ACGTACGTACT"; // 11 bases
 
-        with_kmer_index(&mut processor, |p, k| {
+        with_idx(&mut processor, |p, k| {
             p.process_ref(seq, k);
         });
 
