@@ -2,14 +2,16 @@
 use needletail::bitkmer::canonical;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use std::cmp::min;
+use std::{cmp::min, u64};
 
 /// K-mer encoding, storage, and sequence processing operations
 #[derive(Clone)]
 pub struct KmerProcessor {
     pub k: usize,
+    pub k_cap: u64,
+    pub m: usize,
+    pub m_cap: u64,
     pub threshold: u8,
-    pub bit_cap: u64,
     pub use_canonical: bool,
     pub ref_kmers: Vec<FxHashSet<u64>>,
     pub idx_mask: usize,
@@ -18,18 +20,24 @@ pub struct KmerProcessor {
 impl KmerProcessor {
     pub fn new(k: usize, threshold: u8, use_canonical: bool) -> Self {
         let num_idx = 1024;
-
+        let m = if k > 12 { 10 } else { (k / 2).max(1) };
         KmerProcessor {
             k,
+            k_cap: if k >= 32 {
+                u64::MAX
+            } else {
+                (1 << (k * 2)) - 1
+            },
+            m,
+            m_cap: if k >= 32 {
+                u64::MAX
+            } else {
+                (1 << (m * 2)) - 1
+            },
             threshold,
             use_canonical,
             ref_kmers: vec![FxHashSet::default(); num_idx],
             idx_mask: num_idx - 1,
-            bit_cap: if k >= 32 {
-                u64::MAX
-            } else {
-                (1u64 << (k * 2)) - 1
-            },
         }
     }
 
@@ -40,7 +48,7 @@ impl KmerProcessor {
 
         for &base in seq {
             if let Some(bits) = encode(base) {
-                kmer = ((kmer << 2) | bits) & self.bit_cap;
+                kmer = ((kmer << 2) | bits) & self.k_cap;
                 valid += 1;
 
                 if valid >= self.k {
@@ -74,7 +82,7 @@ impl KmerProcessor {
         for &base in seq {
             match encode(base) {
                 Some(base) => {
-                    kmer = ((kmer << 2) | base) & self.bit_cap;
+                    kmer = ((kmer << 2) | base) & self.k_cap;
 
                     // Update rc kmer: (rc >> 2) | (complement << shift)
                     let rc_base = base ^ 0b11; // Inverse of bits (A -> T)
@@ -109,6 +117,7 @@ impl KmerProcessor {
     }
 
     #[inline(always)]
+    /// Returns the number of k-mers in the reference index.
     pub fn num_kmers(&self) -> usize {
         self.ref_kmers.iter().map(|i| i.len()).sum()
     }
@@ -121,7 +130,7 @@ impl KmerProcessor {
     }
 
     #[inline(always)]
-    /// Assign k-mer to shard.
+    /// Map k-mer to shard using middle bases.
     fn map_kmer(&self, kmer: &u64) -> usize {
         let kmer = kmer ^ (kmer >> 12); // Spread entropy
         kmer as usize & self.idx_mask
@@ -393,7 +402,7 @@ mod tests {
         assert_eq!(processor.k, 21);
         assert_eq!(processor.threshold, 1);
         assert_eq!(processor.ref_kmers.len(), 1024);
-        assert_eq!(processor.bit_cap, (1u64 << 42) - 1);
+        assert_eq!(processor.k_cap, (1u64 << 42) - 1);
     }
 
     #[test]
@@ -401,7 +410,7 @@ mod tests {
         let processor = KmerProcessor::new(15, 3, true);
         assert_eq!(processor.k, 15);
         assert_eq!(processor.threshold, 3);
-        assert_eq!(processor.bit_cap, (1u64 << 30) - 1);
+        assert_eq!(processor.k_cap, (1u64 << 30) - 1);
     }
 
     // REFERENCE PROCESSING TESTS
@@ -511,15 +520,15 @@ mod tests {
     // BIT MANIPULATION TESTS
 
     #[test]
-    fn test_bit_cap_calculation() {
+    fn test_k_cap_calculation() {
         let processor5 = KmerProcessor::new(5, 1, true);
-        assert_eq!(processor5.bit_cap, (1u64 << 10) - 1);
+        assert_eq!(processor5.k_cap, (1u64 << 10) - 1);
 
         let processor10 = KmerProcessor::new(10, 1, true);
-        assert_eq!(processor10.bit_cap, (1u64 << 20) - 1);
+        assert_eq!(processor10.k_cap, (1u64 << 20) - 1);
 
         let processor21 = KmerProcessor::new(21, 1, true);
-        assert_eq!(processor21.bit_cap, (1u64 << 42) - 1);
+        assert_eq!(processor21.k_cap, (1u64 << 42) - 1);
     }
 
     // SLIDING WINDOW TESTS

@@ -3,7 +3,7 @@ use crate::kmer_ops::KmerProcessor;
 
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use crossbeam::channel::{Sender, bounded};
-use needletail::parse_fastx_file;
+use needletail::{parse_fastx_file, parse_fastx_reader};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::{
@@ -25,7 +25,7 @@ use std::{
     time::Instant,
 };
 
-/// Source of input reads (file or stdin).
+/// Source of input reads - either a file path or stdin
 pub enum InputSource {
     File(String),
     Stdin,
@@ -40,7 +40,7 @@ impl fmt::Display for InputSource {
     }
 }
 
-/// A chunk of sequences with their match results.
+/// A chunk of sequences with their match results
 #[derive(Eq, PartialEq)]
 struct SequenceChunk {
     id: u32,
@@ -49,7 +49,7 @@ struct SequenceChunk {
     matches: Vec<bool>,                           // k-mer match results
 }
 
-// Implement Ord to support ordered output
+// Implement Ord for BinaryHeap to support ordered output
 impl Ord for SequenceChunk {
     fn cmp(&self, other: &Self) -> Ordering {
         other.id.cmp(&self.id) // min-heap for sequential processing
@@ -62,7 +62,7 @@ impl PartialOrd for SequenceChunk {
     }
 }
 
-/// Create a reference k-mer index, and process reads against it.
+/// Processing reads against a reference k-mer index
 pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     let available_threads = num_cpus::get();
     let num_threads = args
@@ -210,7 +210,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     Ok(())
 }
 
-/// Load a pre-built k-mer index from a serialized file.
+/// Load a pre-built k-mer index from binary file
 fn deserialize_kmers(
     bin_kmers_path: &str,
     processor: &mut KmerProcessor,
@@ -236,7 +236,7 @@ fn deserialize_kmers(
     Ok(())
 }
 
-/// Build k-mer index from reference FASTA/FASTQ file.
+/// Build k-mer index from reference FASTA/FASTQ file
 fn get_reference_kmers(
     ref_path: &str,
     processor: &mut KmerProcessor,
@@ -296,7 +296,7 @@ fn get_reference_kmers(
     Ok(())
 }
 
-// Delegate single thread to parse reference file and send read sequences.
+// Delegate single thread to parse ref file and send read sequences
 fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error>> {
     let path = path.to_string();
 
@@ -316,7 +316,7 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-/// Save k-mer index to binary file for faster loading later.
+/// Save k-mer index to binary file for faster loading later
 fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
     let bin_file = File::create(path)?;
     let mut bin_writer = BufWriter::new(bin_file);
@@ -330,7 +330,6 @@ fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<
     Ok(())
 }
 
-/// Input/output sequence arrangements.
 #[derive(PartialEq, Clone, Copy, Default)]
 enum ProcessMode {
     #[default]
@@ -341,7 +340,7 @@ enum ProcessMode {
     Interleaved,      // Interleaved input and output
 }
 
-/// Determine input/output mode based on file arguments.
+/// Determine input/output mode based on file arguments
 fn detect_mode(
     reads2_path: &Option<String>,
     matched2_path: &Option<String>,
@@ -386,7 +385,7 @@ fn detect_mode(
     }
 }
 
-/// Process reads from input, filter, and output based on match.
+/// Process reads from input file(s), filter by k-mer matches, and write to output file(s)
 fn process_reads(
     input: InputSource,
     reads2_path: String,
@@ -431,8 +430,8 @@ fn process_reads(
     // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
     let worker_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut reader = match input {
-            InputSource::Stdin => needletail::parse_fastx_reader(stdin()),
-            InputSource::File(ref path) => needletail::parse_fastx_file(path),
+            InputSource::Stdin => parse_fastx_reader(stdin()),
+            InputSource::File(ref path) => parse_fastx_file(path),
         }?;
 
         const CHUNK_SIZE: usize = 10_000;
@@ -825,7 +824,7 @@ fn process_reads(
     ))
 }
 
-/// Write a single read to file in FASTA or FASTQ format.
+/// Write a single read to file in FASTA or FASTQ format
 fn write_read(
     writer: &mut BufWriter<File>,
     id: &[u8],
