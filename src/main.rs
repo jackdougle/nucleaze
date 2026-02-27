@@ -48,19 +48,32 @@ OUTPUT PARAMETERS: use 'stdout.fa / stdout.fq to pipe to stdout'
 MEMORY & PERFORMANCE PARAMETERS
     --k 21              (-k) K-mer size (number of bases per k-mer). Ranges
                         from 1-31, larger k-mers will have less matches.
-    --minhits 1         Minimum number of k-mer matches a read sequence must 
+    --minhits 1         Minimum number of k-mer matches a read sequence must
                         have to be considered a match.
     --threads auto      (-t) Number of threads to use for parallel processing.
                         Program will use all available threads by default.
-    --maxmem auto       (-m) Maximum memory to use, in human readable format. 
+    --maxmem auto       (-m) Maximum memory to use, in human readable format.
                         '--maxmem 5G' will specify 5 gigabytes, '--maxmem 200M'
                         will specify 200 megabytes. No memory limit by default.
     --interinput        (-i) Enable flag to input as interleaved paired-end
                         reads, omit flag for unpaired reads.
     --order             (-o) Enable flag to get read outputs ordered by
                         sequence ID.
-    --canonical         (-c) K-mers are stored and compared in canonical form 
+    --canonical         (-c) K-mers are stored and compared in canonical form
                         (lowest of forward and reverse-complement).
+
+K-MER STORAGE MODE
+    Default (hash):     Lossless k-mer storage using sharded hash sets.
+                        Supports index serialization via --saveref/--binref.
+    Bloom (--fpr > 0):  Approximate k-mer storage using sharded bloom filters.
+                        Faster and lower memory; does not support index
+                        serialization.
+
+    --fpr <f32>         False positive rate for bloom filter mode (default: 0,
+                        disabled). Set > 0 to enable bloom filter mode.
+    --bloomcap <usize>  Estimated total k-mers in reference genome for bloom
+                        filter sizing (default: 5000000). Only used when
+                        --fpr > 0.
                         
 Function and usage documentation at /README.md.
 Contact jack.gdouglass@gmail.com for any questions or issues encountered.
@@ -132,6 +145,14 @@ struct Args {
     /// Enabling flag uses canonical k-mers for comparison
     #[arg(short, long)]
     canonical: bool,
+
+    /// False positive rate for bloom filter mode (0 = disabled, use hash mode)
+    #[arg(long)]
+    fpr: Option<f32>,
+
+    /// Estimated total k-mers in reference genome for bloom filter sizing
+    #[arg(long)]
+    bloomcap: Option<usize>,
 }
 
 fn main() -> io::Result<()> {
@@ -266,6 +287,15 @@ fn validate_args(args: &Args) -> io::Result<()> {
                 "Argument error: matches (--outm2) and non-matches (--outu2) cannot have the same output path",
             ));
         }
+    }
+
+    if let Some(_cap) = args.bloomcap
+        && args.fpr.is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Argument error: You must input a false positive rate (--fpr) if you input --bloomcap",
+        ));
     }
 
     Ok(())
