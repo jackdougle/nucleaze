@@ -6,9 +6,9 @@ use clap::Parser;
 use rlimit::{Resource, setrlimit};
 use std::{env, io, time::Instant};
 
-const ABOUT: &str = "Nucleaze 1.4.1
+const ABOUT: &str = "Nucleaze 1.4.2
 Written by Jack Douglass & Evan Fields
-Last modified January 23rd, 2026
+Last modified January 29th, 2026
 
 Nucleaze compares DNA sequences from input file to DNA sequences from reference
  file using k-mer analysis. Splits up reference file sequences into k-mers of
