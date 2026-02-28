@@ -6,9 +6,9 @@ use clap::Parser;
 use rlimit::{Resource, setrlimit};
 use std::{env, io, time::Instant};
 
-const ABOUT: &str = "Nucleaze 1.4.2
+const ABOUT: &str = "Nucleaze 1.5.0-alpha
 Written by Jack Douglass & Evan Fields
-Last modified January 29th, 2026
+Last modified February 28th, 2026
 
 Nucleaze compares DNA sequences from input file to DNA sequences from reference
  file using k-mer analysis. Splits up reference file sequences into k-mers of
@@ -17,7 +17,7 @@ Nucleaze compares DNA sequences from input file to DNA sequences from reference
  will be printed as a match. Very memory-efficient and performant. Processes
  paired reads in two files or as a single interleaved file.
 
-USAGE: nucleaze --ref <ref file> [--in <reads file>] ...
+USAGE: nucleaze [--in <reads FASTX>] [--ref <ref FASTX>] ...
 
 INPUT PARAMETERS
     --in <file>         Input FASTA/FASTQ file containing reads to be filtered.
@@ -61,20 +61,12 @@ MEMORY & PERFORMANCE PARAMETERS
                         sequence ID.
     --canonical         (-c) K-mers are stored and compared in canonical form
                         (lowest of forward and reverse-complement).
-
-K-MER STORAGE MODE
-    Default (hash):     Lossless k-mer storage using sharded hash sets.
-                        Supports index serialization via --saveref/--binref.
-    Bloom (--fpr > 0):  Approximate k-mer storage using sharded bloom filters.
-                        Faster and lower memory; does not support index
-                        serialization.
-
-    --fpr <f32>         False positive rate for bloom filter mode (default: 0,
+    --fpr 0             False positive rate for bloom filter mode (default: 0,
                         disabled). Set > 0 to enable bloom filter mode.
-    --bloomcap <usize>  Estimated total k-mers in reference genome for bloom
-                        filter sizing (default: 5000000). Only used when
+    --bloomcap 5M       Estimated total k-mers in reference genome for bloom
+                        filter sizing (default: 5M). Only used when
                         --fpr > 0.
-                        
+
 Function and usage documentation at /README.md.
 Contact jack.gdouglass@gmail.com for any questions or issues encountered.
 ";
@@ -165,7 +157,7 @@ fn main() -> io::Result<()> {
     println!("Nucleaze v{} [{}]\n", version, user_args.join(" "));
 
     if let Some(maxmem_str) = &args.maxmem {
-        match parse_memory_size(maxmem_str) {
+        match parse_size(maxmem_str) {
             Ok(size_bytes) => {
                 let soft_limit = size_bytes;
                 let hard_limit = size_bytes;
@@ -198,7 +190,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn parse_memory_size(input: &str) -> Result<u64, String> {
+fn parse_size(input: &str) -> Result<u64, String> {
     let s = input.trim().to_uppercase();
 
     // Split into (number, suffix)

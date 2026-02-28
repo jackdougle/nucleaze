@@ -1057,3 +1057,193 @@ fn test_stdin_input() {
         .success()
         .stdout(predicate::str::contains("reads from stdin"));
 }
+
+#[test]
+fn test_bloom_filter_basic_matching() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")]).unwrap();
+
+    create_fastq(
+        &reads_path,
+        &[
+            ("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII"), // Match
+            ("read2", "TTTTTTTTTTTTTTTTTTTTT", "IIIIIIIIIIIIIIIIIIIII"), // Mismatch
+        ],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--fpr")
+        .arg("0.01")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(
+        matched.contains("read1"),
+        "Bloom mode should match read1 (exact k-mer match). Matched output: {:?}",
+        matched
+    );
+
+    let unmatched = fs::read_to_string(&unmatched_path).unwrap();
+    assert!(
+        unmatched.contains("read2"),
+        "Bloom mode should not match read2 (all T's). Unmatched output: {:?}",
+        unmatched
+    );
+}
+
+#[test]
+fn test_bloom_filter_rejects_saveref() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+    let saveref_path = temp.path().join("index.bin");
+
+    create_fasta(&ref_path, &[("ref1", "ACGTACGTACGTACGTACGTA")]).unwrap();
+    create_fastq(
+        &reads_path,
+        &[("read1", "ACGTACGTACGTACGTACGTA", "IIIIIIIIIIIIIIIIIIIII")],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--fpr")
+        .arg("0.01")
+        .arg("--saveref")
+        .arg(&saveref_path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "serialization is not supported in bloom filter mode",
+        ));
+
+    // Verify no binary index was created
+    assert!(!saveref_path.exists());
+}
+
+#[test]
+fn test_bloom_filter_canonical() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    // Ref: all T's
+    create_fasta(&ref_path, &[("ref", "TTTTT")]).unwrap();
+    // Read: all A's (reverse complement of TTTTT)
+    create_fastq(&reads_path, &[("r1", "AAAAA", "IIIII")]).unwrap();
+
+    // With bloom + canonical, AAAAA should match TTTTT
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("5")
+        .arg("--canonical")
+        .arg("--fpr")
+        .arg("0.01")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(
+        matched.contains("r1"),
+        "Bloom + canonical should match AAAAA against TTTTT ref. Matched: {:?}",
+        matched
+    );
+}
+
+#[test]
+fn test_bloom_filter_large_ref_canonical() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+    let unmatched_path = temp.path().join("unmatched.fq");
+
+    // Generate a large-ish reference (~5000 bases, multiple sequences)
+    let bases = [b'A', b'C', b'G', b'T'];
+    let ref_seq1: String = (0..2000).map(|i| bases[i % 4] as char).collect();
+    let ref_seq2: String = (0..2000).map(|i| bases[(i + 1) % 4] as char).collect();
+    let ref_seq3: String = (0..1000).map(|i| bases[(i + 2) % 4] as char).collect();
+
+    {
+        let mut f = File::create(&ref_path).unwrap();
+        writeln!(f, ">ref1\n{}", ref_seq1).unwrap();
+        writeln!(f, ">ref2\n{}", ref_seq2).unwrap();
+        writeln!(f, ">ref3\n{}", ref_seq3).unwrap();
+    }
+
+    // Reads: first 21 bases from ref_seq1 (exact match), and a non-matching read
+    let matching_read: String = ref_seq1.chars().take(50).collect();
+    let nonmatching_read = "AAAAACCCCCGGGGGTTTTTAGAGAG".to_string()
+        + "TCTCTCAAAAACCCCCGGGGGTTTTTAGAGAG";
+
+    {
+        let mut f = File::create(&reads_path).unwrap();
+        let qual_m: String = (0..matching_read.len()).map(|_| 'I').collect();
+        let qual_n: String = (0..nonmatching_read.len()).map(|_| 'I').collect();
+        writeln!(f, "@match\n{}\n+\n{}", matching_read, qual_m).unwrap();
+        writeln!(f, "@nomatch\n{}\n+\n{}", nonmatching_read, qual_n).unwrap();
+    }
+
+    // Run with bloom + canonical
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--outu")
+        .arg(&unmatched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--canonical")
+        .arg("--fpr")
+        .arg("0.01")
+        .assert()
+        .success();
+
+    let matched = fs::read_to_string(&matched_path).unwrap();
+    assert!(
+        matched.contains("match"),
+        "Bloom+canonical should find the matching read. Matched output: {:?}",
+        matched
+    );
+}

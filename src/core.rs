@@ -1,10 +1,11 @@
 //! I/O for reference indexing and read processing operations using k-mers
-use crate::kmer_ops::{KmerProcessor, KmerStore, ShardedBloomStore, ShardedHashStore};
+use crate::kmer_ops::KmerProcessor;
 
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use crossbeam::channel::{Sender, bounded};
 use needletail::{parse_fastx_file, parse_fastx_reader};
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
@@ -77,67 +78,44 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
 
     let k = args.k.unwrap_or(21);
     let min_hits = args.minhits.unwrap_or(1);
-    let use_canonical = args.canonical;
-    let fpr = args.fpr.unwrap_or(0.0);
 
-    if fpr > 0.0 {
-        let bloomcap = args.bloomcap.unwrap_or(5_000_000);
-        let processor =
-            KmerProcessor::<ShardedBloomStore>::new_bloom(k, min_hits, use_canonical, fpr as f64, bloomcap);
-        run_inner(processor, args, start_time, num_threads)
-    } else {
-        let processor = KmerProcessor::<ShardedHashStore>::new(k, min_hits, use_canonical);
-        run_inner(processor, args, start_time, num_threads)
-    }
-}
-
-fn run_inner<S: KmerStore + 'static>(
-    mut kmer_processor: KmerProcessor<S>,
-    args: crate::Args,
-    start_time: Instant,
-    num_threads: usize,
-) -> IOResult<()> {
     let ordered_output = args.order;
+    let use_canonical = args.canonical;
 
     let ref_path = args.r#ref.unwrap_or_default();
     let bin_kmers_path = &args.binref.unwrap_or_default();
     let new_bin_kmers_path = &args.saveref.unwrap_or_default();
 
-    let is_bloom = args.fpr.unwrap_or(0.0) > 0.0;
+    // Let KmerProcessor process 'bloomcap' and 'fpr' to find best data structure
+    let mut kmer_processor = KmerProcessor::new(
+        k,
+        min_hits,
+        use_canonical,
+        args.bloomcap,
+        args.fpr,
+    );
 
     // Try loading pre-built k-mer index, otherwise build from scratch
     match deserialize_kmers(bin_kmers_path, &mut kmer_processor) {
         Ok(()) => {
             println!(
                 "Loaded {} k-mer(s) from {}",
-                kmer_processor.num_kmers().saturating_sub(1),
+                kmer_processor.num_kmers() - 1, // do not count metadata
                 bin_kmers_path
             );
         }
         Err(e) => {
             if !bin_kmers_path.is_empty() {
-                if is_bloom {
-                    eprintln!("K-mer index serialization is not supported in bloom filter mode.");
-                } else {
-                    eprintln!("Invalid serialized reference file: {}", e);
-                    // If the serialized index had a k-mer length mismatch, exit immediately
-                    if e.to_string().contains("different length") {
-                        exit(1);
-                    }
-                }
+                eprintln!("Invalid serialized reference file: {}", e);
             }
 
             match get_reference_kmers(&ref_path, &mut kmer_processor, num_threads) {
                 Ok(()) => {
-                    if is_bloom {
-                        println!("Indexed k-mers from {} (bloom filter mode)", ref_path);
-                    } else {
-                        println!(
-                            "Added {} k-mer(s) from {}",
-                            kmer_processor.num_kmers().saturating_sub(1),
-                            ref_path,
-                        );
-                    }
+                    println!(
+                        "Added {} k-mer(s) from {}",
+                        kmer_processor.num_kmers() - 1, // do not count metadata
+                        ref_path,
+                    );
                 }
                 Err(e) => {
                     eprintln!("Error loading reference sequences: {}", e);
@@ -146,15 +124,9 @@ fn run_inner<S: KmerStore + 'static>(
             };
 
             if !new_bin_kmers_path.is_empty() {
-                if is_bloom {
-                    eprintln!(
-                        "K-mer index serialization is not supported in bloom filter mode."
-                    );
-                } else {
-                    match serialize_kmers(&new_bin_kmers_path, &mut kmer_processor) {
-                        Ok(()) => println!("Saved serialized k-mers to {}", new_bin_kmers_path),
-                        Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
-                    }
+                match serialize_kmers(&new_bin_kmers_path, &mut kmer_processor) {
+                    Ok(()) => println!("Saved serialized k-mers to {}", new_bin_kmers_path),
+                    Err(e) => eprintln!("\nCould not serialize reference k-mers: {}", e),
                 }
             } else {
                 println!("K-mer index not serialized")
@@ -246,9 +218,9 @@ fn run_inner<S: KmerStore + 'static>(
 }
 
 /// Load a pre-built k-mer index from binary file
-fn deserialize_kmers<S: KmerStore>(
+fn deserialize_kmers(
     bin_kmers_path: &str,
-    processor: &mut KmerProcessor<S>,
+    processor: &mut KmerProcessor,
 ) -> Result<(), Box<dyn Error>> {
     let bin_kmers_file = File::open(bin_kmers_path)?;
     let mut reader = BufReader::new(bin_kmers_file);
@@ -258,8 +230,9 @@ fn deserialize_kmers<S: KmerStore>(
     processor.add_serializable_kmers(raw_ref_kmers);
 
     // Verify k-mer length matches by checking metadata
-    if !processor.ref_kmers.verify_metadata(processor.k) {
-        processor.ref_kmers.clear();
+    let size_metadata = u64::MAX ^ processor.k as u64;
+    if !processor.contains_kmer(&size_metadata) {
+        processor.clear_kmers();
         return Err(format!(
             "k-mers are of different length than specified k ({})",
             processor.k
@@ -271,9 +244,9 @@ fn deserialize_kmers<S: KmerStore>(
 }
 
 /// Build k-mer index from reference FASTA/FASTQ file
-fn get_reference_kmers<S: KmerStore + 'static>(
+fn get_reference_kmers(
     ref_path: &str,
-    processor: &mut KmerProcessor<S>,
+    processor: &mut KmerProcessor,
     num_threads: usize,
 ) -> Result<(), Box<dyn Error>> {
     let ref_meta = metadata(&ref_path)?;
@@ -281,10 +254,10 @@ fn get_reference_kmers<S: KmerStore + 'static>(
         return Err("reference file is empty".into());
     }
 
-    let num_idx: usize = processor.ref_kmers.num_shards();
-    let merged_idx: Arc<Vec<Mutex<Vec<u64>>>> = Arc::new(
+    let num_idx: usize = processor.num_shards();
+    let merged_idx: Arc<Vec<Mutex<FxHashSet<u64>>>> = Arc::new(
         (0..num_idx)
-            .map(|_| Mutex::new(Vec::new()))
+            .map(|_| Mutex::new(FxHashSet::default()))
             .collect(),
     );
 
@@ -292,60 +265,38 @@ fn get_reference_kmers<S: KmerStore + 'static>(
 
     spawn_reader(ref_path, sender).expect("k-mer extraction failed");
 
-    let k = processor.k;
-    let k_cap = processor.k_cap;
-    let use_canonical = processor.use_canonical;
-    let idx_mask = processor.idx_mask;
-
-    // Build a lightweight read-only processor for threads to use process_ref
-    // We create a temporary ShardedHashStore just for process_ref calls (it only writes to idx buffers)
     (0..num_threads).into_par_iter().for_each(|_| {
         let mut local_idx = vec![Vec::with_capacity(64); num_idx];
-        let merged_idx = merged_idx.clone();
-        let receiver = receiver.clone();
-
-        // We need a dummy KmerProcessor just for process_ref.
-        // process_ref only reads k, k_cap, use_canonical, idx_mask — it doesn't touch ref_kmers.
-        // We create a minimal ShardedHashStore(0 shards) since process_ref never accesses it.
-        let dummy = KmerProcessor {
-            k,
-            k_cap,
-            threshold: 1,
-            use_canonical,
-            ref_kmers: ShardedHashStore { shards: Vec::new() },
-            idx_mask,
-        };
 
         while let Ok(seq) = receiver.recv() {
-            dummy.process_ref(&seq, &mut local_idx);
+            processor.process_ref(&seq, &mut local_idx);
 
             for (i, local_subidx) in local_idx.iter_mut().enumerate() {
                 if !local_subidx.is_empty() {
                     let mut merged_subidx = merged_idx[i].lock().unwrap();
-                    merged_subidx.extend_from_slice(local_subidx);
+
+                    for &kmer in local_subidx.iter() {
+                        merged_subidx.insert(kmer);
+                    }
+
                     local_subidx.clear();
                 }
             }
         }
     });
 
-    // Flush merged buffers into the actual store
-    for (i, mutex_vec) in merged_idx.iter().enumerate() {
-        let buf = mutex_vec.lock().unwrap();
-        if !buf.is_empty() {
-            processor.ref_kmers.bulk_insert_shard(i, &buf);
+    for shard in merged_idx.iter() {
+        let guard = shard.lock().unwrap();
+        for &kmer in guard.iter() {
+            processor.insert_kmer(&kmer);
         }
     }
 
-    // For hash stores, check kmer count. For bloom stores, we can't check cardinality,
-    // so we skip this check if num_kmers returns 0 (bloom mode).
-    let count = processor.num_kmers();
-    // Only error if we're in hash mode and got 0 kmers
-    if count == 0 && !std::any::type_name::<S>().contains("Bloom") {
+    if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());
     }
 
-    processor.ref_kmers.insert_metadata(processor.k);
+    processor.insert_kmer(&(u64::MAX ^ processor.k as u64)); // insert metadata
 
     Ok(())
 }
@@ -371,10 +322,7 @@ fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error
 }
 
 /// Save k-mer index to binary file for faster loading later
-fn serialize_kmers<S: KmerStore>(
-    path: &str,
-    processor: &mut KmerProcessor<S>,
-) -> Result<(), Box<dyn Error>> {
+fn serialize_kmers(path: &str, processor: &mut KmerProcessor) -> Result<(), Box<dyn Error>> {
     let bin_file = File::create(path)?;
     let mut bin_writer = BufWriter::new(bin_file);
 
@@ -443,10 +391,10 @@ fn detect_mode(
 }
 
 /// Process reads from input file(s), filter by k-mer matches, and write to output file(s)
-fn process_reads<S: KmerStore + 'static>(
+fn process_reads(
     input: InputSource,
     reads2_path: String,
-    processor: Arc<KmerProcessor<S>>,
+    processor: Arc<KmerProcessor>,
     matched_path: &str,
     unmatched_path: &str,
     matched2_path: &str,
