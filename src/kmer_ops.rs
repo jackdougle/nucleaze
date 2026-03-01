@@ -3,9 +3,12 @@ use needletail::bitkmer::canonical;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 pub trait KmerStore: Send + Sync {
     fn new(size: usize, fpr: f64) -> Self;
     fn map(&self, kmer: &u64) -> usize;
+    fn stage(&self, kmer: u64, subindex: &mut Vec<Vec<u64>>);
     fn insert(&mut self, kmer: &u64);
     fn contains(&self, kmer: &u64) -> bool;
     fn count(&self) -> usize;
@@ -41,6 +44,13 @@ impl KmerStore for HashShards {
     fn map(&self, kmer: &u64) -> usize {
         let hashed = kmer ^ (kmer >> 12);
         hashed as usize & self.mask
+    }
+
+    /// Add a k-mer to a temporary & external subindex.
+    #[inline(always)]
+    fn stage(&self, kmer: u64, subindex: &mut Vec<Vec<u64>>) {
+        let idx = self.map(&kmer);
+        subindex[idx].push(kmer);
     }
 
     /// Check shard for presence for k-mer.
@@ -91,9 +101,9 @@ impl HashShards {
 }
 
 pub struct MiniBloom {
-    index: Vec<u64>,
+    index: Vec<AtomicU64>,
     mask: u64,
-    count: usize,
+    count: AtomicUsize,
 }
 
 impl KmerStore for MiniBloom {
@@ -111,18 +121,10 @@ impl KmerStore for MiniBloom {
         println!("Number of indices in Bloom filter: {}", num_idx);
 
         MiniBloom {
-            index: vec![0u64; num_idx],
+            index: (0..num_idx).map(|_| AtomicU64::new(0)).collect(),
             mask: (num_idx as u64 * 64 - 1),
-            count: 0,
+            count: AtomicUsize::new(0),
         }
-    }
-
-    /// O(1) Bloom filter insert.
-    fn insert(&mut self, kmer: &u64) {
-        let pos = kmer & self.mask;
-        let i = (pos / 64) as usize;
-        self.index[i] |= 1 << (pos % 64);
-        self.count += 1;
     }
 
     /// Find k-mer's Bloom index.
@@ -130,25 +132,40 @@ impl KmerStore for MiniBloom {
         (kmer & self.mask) as usize
     }
 
+    /// O(1) Bloom filter insert.
+    fn insert(&mut self, kmer: &u64) {
+        let pos = kmer & self.mask;
+        let i = (pos / 64) as usize;
+        self.index[i].fetch_or(1 << (pos % 64), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Insertion wrapper.
+    fn stage(&self, kmer: u64, _subindex: &mut Vec<Vec<u64>>) {
+        let pos = kmer & self.mask;
+        let i = (pos / 64) as usize;
+        self.index[i].fetch_or(1 << (pos % 64), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// O(1) Bloom filter query.
     fn contains(&self, kmer: &u64) -> bool {
         let pos = self.map(kmer);
         let idx = (pos / 64) as usize;
-        if self.index[idx] & 1 << (pos % 64) == 0 {
-            return false;
-        }
-        true
+        self.index[idx].load(Ordering::Relaxed) & (1 << (pos % 64)) != 0
     }
 
     /// Clear Bloom filter.
     fn clear(&mut self) {
-        self.index.fill(0);
-        self.count = 0;
+        for kmer in self.index.iter() {
+            kmer.store(0, Ordering::Relaxed);
+        }
+        self.count.store(0, Ordering::Relaxed);
     }
 
     /// Return k-mer counter.
     fn count(&self) -> usize {
-        self.count
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Add serialized k-mers to Bloom filter.
@@ -157,7 +174,7 @@ impl KmerStore for MiniBloom {
         let idx: &[AtomicU64] = unsafe {
             std::slice::from_raw_parts(self.index.as_ptr() as *const AtomicU64, self.index.len())
         };
-        let total: usize = data
+        let total = data
             .par_iter()
             .map(|shard| {
                 for kmer in shard {
@@ -169,7 +186,7 @@ impl KmerStore for MiniBloom {
                 shard.len()
             })
             .sum();
-        self.count += total;
+        self.count.fetch_add(total, Ordering::Relaxed);
     }
 
     /// Absorb pre-sharded sets by inserting each k-mer into the Bloom filter.
@@ -208,7 +225,7 @@ impl<S: KmerStore> KmerProcessor<S> {
     }
 
     /// Add k-mers from sequence to reference index.
-    pub fn process_ref(&self, seq: &[u8], idx: &mut Vec<Vec<u64>>) {
+    pub fn process_ref(&self, seq: &[u8], subindex: &mut Vec<Vec<u64>>) {
         let mut kmer = 0u64;
         let mut valid = 0usize;
 
@@ -218,14 +235,13 @@ impl<S: KmerStore> KmerProcessor<S> {
                 valid += 1;
 
                 if valid >= self.k {
-                    let final_kmer = if self.use_canonical {
+                    let kmer_to_store = if self.use_canonical {
                         canonical((kmer, self.k as u8)).0.0
                     } else {
                         kmer
                     };
 
-                    let sid = self.map_kmer(&final_kmer);
-                    idx[sid].push(final_kmer);
+                    self.stage_kmer(kmer_to_store, subindex);
                 }
             } else {
                 kmer = 0;
@@ -282,26 +298,27 @@ impl<S: KmerStore> KmerProcessor<S> {
         false
     }
 
-    fn map_kmer(&self, kmer: &u64) -> usize {
-        self.ref_kmers.map(kmer)
+    // KmerProcessor wrapper for KmerStore::stage().
+    #[inline(always)]
+    pub fn stage_kmer(&self, kmer: u64, subindex: &mut Vec<Vec<u64>>) {
+        self.ref_kmers.stage(kmer, subindex);
     }
 
+    // KmerProcessor wrapper for KmerStore::insert().
     #[inline(always)]
     pub fn insert_kmer(&mut self, kmer: &u64) {
         self.ref_kmers.insert(kmer);
     }
 
+    // KmerProcessor wrapper for KmerStore::contains().
     #[inline(always)]
     pub fn contains_kmer(&self, kmer: &u64) -> bool {
         self.ref_kmers.contains(kmer)
     }
 
+    // KmerProcessor wrapper for KmerStore::count().
     pub fn num_kmers(&self) -> usize {
         self.ref_kmers.count()
-    }
-
-    pub fn num_shards(&self) -> usize {
-        1024
     }
 }
 

@@ -328,9 +328,9 @@ fn get_reference_kmers<S: KmerStore>(
         return Err("reference file is empty".into());
     }
 
-    let num_idx: usize = processor.num_shards();
+    const SUBINDEX_COUNT: usize = 1024;
     let merged_idx: Arc<Vec<Mutex<FxHashSet<u64>>>> = Arc::new(
-        (0..num_idx)
+        (0..SUBINDEX_COUNT)
             .map(|_| Mutex::new(FxHashSet::default()))
             .collect(),
     );
@@ -340,7 +340,7 @@ fn get_reference_kmers<S: KmerStore>(
     spawn_reader(ref_path, sender).expect("k-mer extraction failed");
 
     (0..num_threads).into_par_iter().for_each(|_| {
-        let mut local_idx = vec![Vec::with_capacity(64); num_idx];
+        let mut local_idx = vec![Vec::with_capacity(64); SUBINDEX_COUNT];
 
         while let Ok(seq) = receiver.recv() {
             processor.process_ref(&seq, &mut local_idx);
@@ -681,10 +681,10 @@ fn process_reads<S: KmerStore + 'static>(
             None
         };
 
-    let matched_count = Arc::new(AtomicU64::new(0));
-    let matched_bases = Arc::new(AtomicU64::new(0));
-    let unmatched_count = Arc::new(AtomicU64::new(0));
-    let unmatched_bases = Arc::new(AtomicU64::new(0));
+    let mseq_count = Arc::new(AtomicU64::new(0));
+    let mbase_count = Arc::new(AtomicU64::new(0));
+    let useq_count = Arc::new(AtomicU64::new(0));
+    let ubase_count = Arc::new(AtomicU64::new(0));
 
     // Write a SequenceChunk to disk, reconstructing reads from the arena
     let mut chunk_output = |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
@@ -714,8 +714,8 @@ fn process_reads<S: KmerStore + 'static>(
                         &matched_filetype,
                         matched_stdout,
                     )?;
-                    matched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                    matched_bases.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
+                    mseq_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    mbase_count.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
                 } else {
                     write_read(
                         &mut unmatched_writer,
@@ -725,8 +725,8 @@ fn process_reads<S: KmerStore + 'static>(
                         &unmatched_filetype,
                         unmatched_stdout,
                     )?;
-                    unmatched_count.fetch_add(1, AtomicOrdering::Relaxed);
-                    unmatched_bases.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
+                    useq_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    ubase_count.fetch_add(seq.len() as u64, AtomicOrdering::Relaxed);
                 }
             }
         } else {
@@ -753,15 +753,15 @@ fn process_reads<S: KmerStore + 'static>(
                     (
                         &mut matched_writer,
                         m2_writer.as_mut(),
-                        &matched_count,
-                        &matched_bases,
+                        &mseq_count,
+                        &mbase_count,
                     )
                 } else {
                     (
                         &mut unmatched_writer,
                         u2_writer.as_mut(),
-                        &unmatched_count,
-                        &unmatched_bases,
+                        &useq_count,
+                        &ubase_count,
                     )
                 };
 
@@ -895,10 +895,10 @@ fn process_reads<S: KmerStore + 'static>(
     }
 
     Ok((
-        matched_count.load(AtomicOrdering::Relaxed),
-        matched_bases.load(AtomicOrdering::Relaxed),
-        unmatched_count.load(AtomicOrdering::Relaxed),
-        unmatched_bases.load(AtomicOrdering::Relaxed),
+        mseq_count.load(AtomicOrdering::Relaxed),
+        mbase_count.load(AtomicOrdering::Relaxed),
+        useq_count.load(AtomicOrdering::Relaxed),
+        ubase_count.load(AtomicOrdering::Relaxed),
     ))
 }
 
