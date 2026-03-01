@@ -359,12 +359,12 @@ fn get_reference_kmers<S: KmerStore>(
         }
     });
 
-    for shard in merged_idx.iter() {
-        let guard = shard.lock().unwrap();
-        for &kmer in guard.iter() {
-            processor.insert_kmer(&kmer);
-        }
-    }
+    let shards = Arc::try_unwrap(merged_idx)
+        .expect("merged_idx still has multiple owners")
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect();
+    processor.ref_kmers.absorb_shards(shards);
 
     if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());

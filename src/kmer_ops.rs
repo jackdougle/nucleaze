@@ -11,6 +11,8 @@ pub trait KmerStore: Send + Sync {
     fn count(&self) -> usize;
     fn clear(&mut self);
     fn from_serialized(&mut self, data: Vec<Vec<u64>>);
+    /// Bulk-load pre-sharded k-mer sets from the reference indexing accumulator.
+    fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>);
 }
 
 pub struct HashShards {
@@ -58,6 +60,11 @@ impl KmerStore for HashShards {
         self.index = vec![FxHashSet::default(); self.mask + 1];
     }
 
+    /// Absorb pre-sharded sets directly into the index.
+    fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>) {
+        self.index = shards;
+    }
+
     /// Add serialized k-mers to reference index.
     fn from_serialized(&mut self, data: Vec<Vec<u64>>) {
         self.index
@@ -101,6 +108,7 @@ impl KmerStore for MiniBloom {
             (m_bits / 64.0).ceil().max(1.0) as usize
         }
         let num_idx = compute_size(size, fpr);
+        println!("Number of indices in Bloom filter: {}", num_idx);
 
         MiniBloom {
             index: vec![0u64; num_idx],
@@ -162,11 +170,15 @@ impl KmerStore for MiniBloom {
             })
             .sum();
         self.count += total;
-        // for shard in data {
-        //     for kmer in shard {
-        //         self.insert(&kmer);
-        //     }
-        // }
+    }
+
+    /// Absorb pre-sharded sets by inserting each k-mer into the Bloom filter.
+    fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>) {
+        for set in shards {
+            for kmer in set {
+                self.insert(&kmer);
+            }
+        }
     }
 }
 
