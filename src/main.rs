@@ -2,9 +2,12 @@
 mod core;
 mod kmer_ops;
 
+use std::env;
+use std::io;
+use std::time::Instant;
+
 use clap::Parser;
 use rlimit::{Resource, setrlimit};
-use std::{env, io, time::Instant};
 
 const ABOUT: &str = "Nucleaze 1.5.0-alpha
 Written by Jack Douglass & Evan Fields

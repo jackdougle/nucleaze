@@ -1,29 +1,28 @@
 //! I/O for reference indexing and read processing operations using k-mers
 use crate::kmer_ops::{HashShards, KmerProcessor, KmerStore, MiniBloom};
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FormatResult};
+use std::fs::{File, metadata, remove_file};
+use std::io::{BufReader, BufWriter, Result as IOResult, Write, stdin};
+use std::mem;
+use std::process::exit;
+use std::str::from_utf8_unchecked;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
+    mpsc::{Receiver, SyncSender, sync_channel},
+};
+use std::thread;
+use std::time::Instant;
+
 use bincode::{config, decode_from_std_read, encode_into_std_write};
 use crossbeam::channel::{Sender, bounded};
 use needletail::{parse_fastx_file, parse_fastx_reader};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use std::{
-    cmp::Ordering,
-    collections::BinaryHeap,
-    error::Error,
-    fmt,
-    fs::{File, metadata, remove_file},
-    io::{BufReader, BufWriter, Result as IOResult, Write, stdin},
-    mem,
-    process::exit,
-    str::from_utf8_unchecked,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
-    thread,
-    time::Instant,
-};
 
 /// Source of input reads - either a file path or stdin
 pub enum InputSource {
@@ -31,8 +30,8 @@ pub enum InputSource {
     Stdin,
 }
 
-impl fmt::Display for InputSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for InputSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FormatResult {
         match self {
             InputSource::File(path) => write!(f, "{}", path),
             InputSource::Stdin => write!(f, "stdin"),
