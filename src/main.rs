@@ -8,7 +8,7 @@ use std::{env, io, time::Instant};
 
 const ABOUT: &str = "Nucleaze 1.5.0-alpha
 Written by Jack Douglass & Evan Fields
-Last modified February 28th, 2026
+Last modified March 1st, 2026
 
 Nucleaze compares DNA sequences from input file to DNA sequences from reference
  file using k-mer analysis. Splits up reference file sequences into k-mers of
@@ -138,13 +138,9 @@ struct Args {
     #[arg(short, long)]
     canonical: bool,
 
-    /// False positive rate for bloom filter mode (0 = disabled, use hash mode)
+    /// False positive rate for bloom filter mode (0 = lossless mode)
     #[arg(long)]
-    fpr: Option<f32>,
-
-    /// Estimated total k-mers in reference genome for bloom filter sizing
-    #[arg(long)]
-    bloomcap: Option<usize>,
+    fpr: Option<f64>,
 }
 
 fn main() -> io::Result<()> {
@@ -154,7 +150,7 @@ fn main() -> io::Result<()> {
 
     let version = env!("CARGO_PKG_VERSION");
     let user_args: Vec<String> = env::args().skip(1).collect();
-    println!("Nucleaze v{} [{}]\n", version, user_args.join(" "));
+    println!("Nucleaze v{} [{}]", version, user_args.join(" "));
 
     if let Some(maxmem_str) = &args.maxmem {
         match parse_size(maxmem_str) {
@@ -177,12 +173,9 @@ fn main() -> io::Result<()> {
     match validate_args(&args) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("{}", e)
+            eprintln!("{}", e);
+            std::process::exit(1);
         }
-    }
-
-    if validate_args(&args).is_err() {
-        std::process::exit(1)
     }
 
     core::run(args, start_time)?;
@@ -281,14 +274,14 @@ fn validate_args(args: &Args) -> io::Result<()> {
         }
     }
 
-    if let Some(_cap) = args.bloomcap
-        && args.fpr.is_none()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Argument error: You must input a false positive rate (--fpr) if you input --bloomcap",
-        ));
-    }
+    // if let Some(_cap) = args.bloomcap
+    //     && args.fpr.is_none()
+    // {
+    //     return Err(io::Error::new(
+    //         io::ErrorKind::InvalidInput,
+    //         "Argument error: You must input a false positive rate (--fpr) if you input --bloomcap",
+    //     ));
+    // }
 
     Ok(())
 }
