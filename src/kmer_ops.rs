@@ -640,17 +640,22 @@ impl<S: KmerStore> KmerProcessor<S> {
 
 impl KmerProcessor<MiniBloom> {
     /// Extract k-mers from a sequence and insert them into the bloom filter.
-    /// Uses software-pipelined prefetch: hash+prefetch one k-mer ahead so the
-    /// cache line is warm by the time we actually write the bits.
+    /// Uses a depth-8 ring buffer to prefetch cache lines far enough ahead
+    /// to hide DRAM latency (~200-300 cycles) behind useful computation.
     #[inline(always)]
     pub fn insert_kmers_bloom(&self, seq: &[u8]) -> u64 {
+        const DEPTH: usize = 8;
+
         let bloom = &self.ref_kmers;
         let mut kmer = 0u64;
         let mut rc_kmer = 0u64;
         let mut valid_bases = 0usize;
         let mut count = 0u64;
         let rc_shift = 2 * (self.k - 1);
-        let mut pending: Option<(usize, u64, u64)> = None;
+
+        let mut queue = [(0usize, 0u64, 0u64); DEPTH];
+        let mut q_head: usize = 0;
+        let mut q_len: usize = 0;
 
         for &base in seq {
             if let Some(bits) = encode(base) {
@@ -659,41 +664,60 @@ impl KmerProcessor<MiniBloom> {
                 valid_bases += 1;
 
                 if valid_bases >= self.k {
-                    // Flush pending insert (block should be in L1 now)
-                    if let Some((bs, h2, h1u)) = pending {
-                        bloom.insert_prehashed(bs, h2, h1u);
-                        count += 1;
-                    }
-
                     let canonical = if self.use_canonical {
                         std::cmp::min(kmer, rc_kmer)
                     } else {
                         kmer
                     };
-                    pending = Some(bloom.hash_and_prefetch(canonical));
+                    let pending = bloom.hash_and_prefetch(canonical);
+
+                    // When full, the oldest prefetch has had DEPTH iterations to arrive in L1
+                    if q_len == DEPTH {
+                        let (bs, h2, h1u) = queue[q_head];
+                        bloom.insert_prehashed(bs, h2, h1u);
+                        count += 1;
+                    } else {
+                        q_len += 1;
+                    }
+
+                    queue[q_head] = pending;
+                    q_head = (q_head + 1) & (DEPTH - 1);
                 }
             } else {
-                if let Some((bs, h2, h1u)) = pending.take() {
+                // Drain queue on ambiguous base
+                while q_len > 0 {
+                    let idx = (q_head + DEPTH - q_len) & (DEPTH - 1);
+                    let (bs, h2, h1u) = queue[idx];
                     bloom.insert_prehashed(bs, h2, h1u);
                     count += 1;
+                    q_len -= 1;
                 }
                 kmer = 0;
                 rc_kmer = 0;
                 valid_bases = 0;
+                q_head = 0;
             }
         }
-        // Flush final pending insert
-        if let Some((bs, h2, h1u)) = pending {
+
+        // Drain remaining
+        while q_len > 0 {
+            let idx = (q_head + DEPTH - q_len) & (DEPTH - 1);
+            let (bs, h2, h1u) = queue[idx];
             bloom.insert_prehashed(bs, h2, h1u);
             count += 1;
+            q_len -= 1;
         }
         count
     }
 
-    /// Bloom path: software-pipelined prefetch defers the membership check
-    /// by one k-mer so the cache line fetch overlaps with useful work.
+    /// Check if a read matches the reference bloom filter.
+    /// Uses a depth-8 prefetch ring buffer so the cache line for each k-mer's
+    /// block is fetched from DRAM ~8 iterations before it is read, hiding
+    /// the full memory latency behind k-mer extraction work.
     #[inline(always)]
     pub fn process_read_bloom(&self, seq: &[u8]) -> bool {
+        const DEPTH: usize = 8;
+
         if seq.len() < self.k {
             return false;
         }
@@ -703,7 +727,10 @@ impl KmerProcessor<MiniBloom> {
         let mut rc_kmer: u64 = 0;
         let mut valid_bases: usize = 0;
         let rc_shift = 2 * (self.k - 1);
-        let mut pending: Option<(usize, u64, u64)> = None;
+
+        let mut queue = [(0usize, 0u64, 0u64); DEPTH];
+        let mut q_head: usize = 0;
+        let mut q_len: usize = 0;
 
         for &base in seq {
             match encode(base) {
@@ -713,47 +740,61 @@ impl KmerProcessor<MiniBloom> {
                     valid_bases += 1;
 
                     if valid_bases >= self.k {
-                        // Check pending contains (block should be in L1 now)
-                        if let Some((bs, h2, h1u)) = pending {
+                        let canonical = if self.use_canonical {
+                            std::cmp::min(kmer, rc_kmer)
+                        } else {
+                            kmer
+                        };
+                        let pending = bloom.hash_and_prefetch(canonical);
+
+                        if q_len == DEPTH {
+                            let (bs, h2, h1u) = queue[q_head];
                             if bloom.contains_prehashed(bs, h2, h1u) {
                                 hits += 1;
                                 if hits >= self.threshold {
                                     return true;
                                 }
                             }
+                        } else {
+                            q_len += 1;
                         }
 
-                        let canonical = if self.use_canonical {
-                            std::cmp::min(kmer, rc_kmer)
-                        } else {
-                            kmer
-                        };
-                        pending = Some(bloom.hash_and_prefetch(canonical));
+                        queue[q_head] = pending;
+                        q_head = (q_head + 1) & (DEPTH - 1);
                     }
                 }
                 None => {
-                    if let Some((bs, h2, h1u)) = pending.take() {
+                    // Drain queue on ambiguous base
+                    while q_len > 0 {
+                        let idx = (q_head + DEPTH - q_len) & (DEPTH - 1);
+                        let (bs, h2, h1u) = queue[idx];
                         if bloom.contains_prehashed(bs, h2, h1u) {
                             hits += 1;
                             if hits >= self.threshold {
                                 return true;
                             }
                         }
+                        q_len -= 1;
                     }
                     valid_bases = 0;
                     kmer = 0;
                     rc_kmer = 0;
+                    q_head = 0;
                 }
             }
         }
-        // Check final pending
-        if let Some((bs, h2, h1u)) = pending {
+
+        // Drain remaining
+        while q_len > 0 {
+            let idx = (q_head + DEPTH - q_len) & (DEPTH - 1);
+            let (bs, h2, h1u) = queue[idx];
             if bloom.contains_prehashed(bs, h2, h1u) {
                 hits += 1;
                 if hits >= self.threshold {
                     return true;
                 }
             }
+            q_len -= 1;
         }
         false
     }
