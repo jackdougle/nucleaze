@@ -383,7 +383,12 @@ impl KmerStore for MiniBloom {
         );
 
         MiniBloom {
-            data: (0..total_words).map(|_| AtomicU64::new(0)).collect(),
+            data: {
+                let raw: Vec<u64> = vec![0u64; total_words];
+                // SAFETY: AtomicU64 has the same size, alignment, and bit validity as u64.
+                // Zero bits is a valid AtomicU64 representing the value 0.
+                unsafe { std::mem::transmute::<Vec<u64>, Vec<AtomicU64>>(raw) }
+            },
             num_blocks_mask: num_blocks as u64 - 1,
             num_hashes: num_hashes as u32,
             num_bits,
@@ -640,11 +645,13 @@ impl<S: KmerStore> KmerProcessor<S> {
 
 impl KmerProcessor<MiniBloom> {
     /// Extract k-mers from a sequence and insert them into the bloom filter.
-    /// Uses a depth-8 ring buffer to prefetch cache lines far enough ahead
-    /// to hide DRAM latency (~200-300 cycles) behind useful computation.
+    /// Uses a depth-16 ring buffer to prefetch cache lines far enough ahead
+    /// to hide DRAM latency (~250 cycles) behind useful computation.
+    /// Each loop iteration is ~17 cycles, so depth 16 gives ~272 cycles of
+    /// lead time — enough to fully cover the round-trip to main memory.
     #[inline(always)]
     pub fn insert_kmers_bloom(&self, seq: &[u8]) -> u64 {
-        const DEPTH: usize = 8;
+        const DEPTH: usize = 16;
 
         let bloom = &self.ref_kmers;
         let mut kmer = 0u64;
@@ -711,12 +718,12 @@ impl KmerProcessor<MiniBloom> {
     }
 
     /// Check if a read matches the reference bloom filter.
-    /// Uses a depth-8 prefetch ring buffer so the cache line for each k-mer's
-    /// block is fetched from DRAM ~8 iterations before it is read, hiding
-    /// the full memory latency behind k-mer extraction work.
+    /// Uses a depth-16 prefetch ring buffer so the cache line for each k-mer's
+    /// block is fetched from DRAM ~16 iterations (~272 cycles) before it is
+    /// read, fully hiding main memory latency behind k-mer extraction work.
     #[inline(always)]
     pub fn process_read_bloom(&self, seq: &[u8]) -> bool {
-        const DEPTH: usize = 8;
+        const DEPTH: usize = 16;
 
         if seq.len() < self.k {
             return false;
