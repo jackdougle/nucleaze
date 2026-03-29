@@ -1,5 +1,5 @@
 //! I/O for reference indexing and read processing operations using k-mers
-use crate::kmer_ops::{HashShards, KmerProcessor, KmerStore, MiniBloom};
+use crate::kmer_ops::{HashShards, KmerProcessor, KmerStore, MiniBloom, per_kmer_fpr};
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -109,30 +109,90 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     };
 
     if fpr > 0.0 {
-        // Bloom mode — no serialization support
-        if !bin_kmers_path.is_empty() {
-            eprintln!("Warning: --binref is not supported in bloom filter mode. Ignoring.");
-        }
-        if !save_kmers_path.is_empty() {
-            eprintln!("Warning: --saveref is not supported in bloom filter mode. Ignoring.");
-        }
-        let store = MiniBloom::new(ref_size as usize, fpr as f64);
-        let mut processor = KmerProcessor::new(k, min_hits, use_canonical, store);
+        // Bloom mode — try loading pre-built bloom index, otherwise build from scratch
+        let kmer_fpr = per_kmer_fpr(fpr as f64, k);
 
-        match get_reference_kmers(&ref_path, &mut processor, num_threads) {
-            Ok(()) => println!(
-                "Added {} k-mer(s) from {}",
-                processor.num_kmers() - 1,
-                ref_path
-            ),
+        if !bin_kmers_path.is_empty() {
+            let nkb_path = format!("{}.nkb", bin_kmers_path);
+            match MiniBloom::load(&nkb_path) {
+                Ok((bloom, loaded_k, kmer_count)) => {
+                    if loaded_k as usize != k {
+                        eprintln!(
+                            "Error: bloom file has k={} but --k {} was specified",
+                            loaded_k, k
+                        );
+                        exit(1);
+                    }
+                    println!(
+                        "Loaded ~{} k-mer(s) from {} (bloom: {} bits, {} hashes)",
+                        kmer_count, nkb_path, bloom.num_bits, bloom.num_hashes,
+                    );
+                    let processor = Arc::new(KmerProcessor::new(k, min_hits, use_canonical, bloom));
+                    let read_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = {
+                        let p = processor.clone();
+                        Arc::new(move |seq: &[u8]| p.process_read_bloom(seq))
+                    };
+
+                    return run_inner(
+                        read_fn,
+                        input,
+                        in2,
+                        outm,
+                        outu,
+                        outm2,
+                        outu2,
+                        ordered_output,
+                        interleaved_input,
+                        start_time,
+                        num_threads,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Could not load bloom index from {}: {}", nkb_path, e);
+                    eprintln!("Building from scratch.");
+                }
+            }
+        }
+
+        let store = MiniBloom::new(ref_size as usize, kmer_fpr);
+        let processor = KmerProcessor::new(k, min_hits, use_canonical, store);
+
+        match get_reference_kmers_bloom(&ref_path, &processor, num_threads) {
+            Ok(kmer_count) => {
+                let (avg, min_f, max_f) = processor.ref_kmers.fill_stats();
+                eprintln!(
+                    "Bloom fill: avg={:.1}%, min={:.1}%, max={:.1}%",
+                    avg * 100.0,
+                    min_f * 100.0,
+                    max_f * 100.0,
+                );
+                println!("Added {} k-mer(s) from {}", kmer_count, ref_path);
+            }
             Err(e) => {
                 eprintln!("Error loading reference sequences: {}", e);
                 exit(1);
             }
         }
 
+        if !save_kmers_path.is_empty() {
+            let nkb_path = format!("{}.nkb", save_kmers_path);
+            match processor
+                .ref_kmers
+                .save(&nkb_path, k as u64, processor.num_kmers() as u64)
+            {
+                Ok(()) => println!("Saved bloom filter to {}", nkb_path),
+                Err(e) => eprintln!("Could not save bloom filter: {}", e),
+            }
+        }
+
+        let processor = Arc::new(processor);
+        let read_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = {
+            let p = processor.clone();
+            Arc::new(move |seq: &[u8]| p.process_read_bloom(seq))
+        };
+
         run_inner(
-            processor,
+            read_fn,
             input,
             in2,
             outm,
@@ -183,8 +243,14 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
             }
         }
 
+        let processor = Arc::new(processor);
+        let read_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = {
+            let p = processor.clone();
+            Arc::new(move |seq: &[u8]| p.process_read(seq))
+        };
+
         run_inner(
-            processor,
+            read_fn,
             input,
             in2,
             outm,
@@ -199,8 +265,8 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     }
 }
 
-fn run_inner<S: KmerStore + 'static>(
-    processor: KmerProcessor<S>,
+fn run_inner(
+    read_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     input: InputSource,
     in2: Option<String>,
     outm: Option<String>,
@@ -215,7 +281,6 @@ fn run_inner<S: KmerStore + 'static>(
     let indexing_time = start_time.elapsed().as_secs_f32();
     println!("Indexing time:\t\t{:.3} seconds\n", indexing_time);
 
-    let kmer_processor = Arc::new(processor);
     let process_mode = detect_mode(&in2, &outm2, &outu2, interleaved_input);
 
     let in2_path = in2.unwrap_or_default();
@@ -234,7 +299,7 @@ fn run_inner<S: KmerStore + 'static>(
     match process_reads(
         input,
         in2_path,
-        kmer_processor,
+        read_fn,
         &outm_path,
         &outu_path,
         &outm2_path,
@@ -359,12 +424,14 @@ fn get_reference_kmers<S: KmerStore>(
         }
     });
 
-    let shards = Arc::try_unwrap(merged_idx)
-        .expect("merged_idx still has multiple owners")
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect();
-    processor.ref_kmers.absorb_shards(shards);
+    if processor.needs_absorb() {
+        let shards = Arc::try_unwrap(merged_idx)
+            .expect("merged_idx still has multiple owners")
+            .into_iter()
+            .map(|m| m.into_inner().unwrap())
+            .collect();
+        processor.ref_kmers.absorb_shards(shards);
+    }
 
     if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());
@@ -373,6 +440,45 @@ fn get_reference_kmers<S: KmerStore>(
     processor.insert_kmer(&(u64::MAX ^ processor.k as u64)); // insert metadata
 
     Ok(())
+}
+
+/// Build k-mer index from reference using direct atomic bloom insertion with prefetch.
+/// Bypasses the stage/absorb pipeline for better performance.
+fn get_reference_kmers_bloom(
+    ref_path: &str,
+    processor: &KmerProcessor<MiniBloom>,
+    num_threads: usize,
+) -> Result<u64, Box<dyn Error>> {
+    let ref_meta = metadata(ref_path)?;
+    if ref_meta.is_file() && ref_meta.len() == 0 {
+        return Err("reference file is empty".into());
+    }
+
+    let kmer_counter = Arc::new(AtomicU64::new(0));
+    let (sender, receiver) = bounded::<Vec<u8>>(16);
+    spawn_reader(ref_path, sender)?;
+
+    // Parallel k-mer extraction + atomic bloom insertion with software-pipelined prefetch
+    let counter_ref = kmer_counter.clone();
+    (0..num_threads).into_par_iter().for_each(|_| {
+        let mut count = 0u64;
+        while let Ok(seq) = receiver.recv() {
+            count += processor.insert_kmers_bloom(&seq);
+        }
+        counter_ref.fetch_add(count, AtomicOrdering::Relaxed);
+    });
+
+    let total_kmers = kmer_counter.load(AtomicOrdering::Relaxed);
+    if total_kmers == 0 {
+        return Err("reference file(s) contained no usable k-mers".into());
+    }
+
+    // Insert metadata sentinel
+    processor
+        .ref_kmers
+        .insert_prehashed_item(u64::MAX ^ processor.k as u64);
+
+    Ok(total_kmers)
 }
 
 // Delegate single thread to parse ref file and send read sequences
@@ -466,10 +572,10 @@ fn detect_mode(
 }
 
 /// Process reads from input file(s), filter by k-mer matches, and write to output file(s)
-fn process_reads<S: KmerStore + 'static>(
+fn process_reads(
     input: InputSource,
     reads2_path: String,
-    processor: Arc<KmerProcessor<S>>,
+    read_fn: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     matched_path: &str,
     unmatched_path: &str,
     matched2_path: &str,
@@ -522,7 +628,7 @@ fn process_reads<S: KmerStore + 'static>(
         // Dispatch filled arena to Rayon for parallel k-mer processing
         let process_arena =
             |local_arena: Vec<u8>, local_offsets: Vec<(u32, u32, u32, u32, u32, u32)>| {
-                let processor = processor.clone();
+                let read_fn = read_fn.clone();
                 let sender = parallel_sender.clone();
                 let current_chunk_pos = parellel_chunk_pos.fetch_add(1, AtomicOrdering::SeqCst);
 
@@ -534,7 +640,7 @@ fn process_reads<S: KmerStore + 'static>(
                         .map(|(_, _, seq_start, seq_len, _, _)| {
                             let seq =
                                 &local_arena[*seq_start as usize..(*seq_start + *seq_len) as usize];
-                            processor.process_read(seq)
+                            read_fn(seq)
                         })
                         .collect();
 

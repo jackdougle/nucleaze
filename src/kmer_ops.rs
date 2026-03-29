@@ -2,8 +2,9 @@
 use needletail::bitkmer::canonical;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub trait KmerStore: Send + Sync {
     fn new(size: usize, fpr: f64) -> Self;
@@ -16,6 +17,9 @@ pub trait KmerStore: Send + Sync {
     fn from_serialized(&mut self, data: Vec<Vec<u64>>);
     /// Bulk-load pre-sharded k-mer sets from the reference indexing accumulator.
     fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>);
+    /// Whether `stage` buffers into the subindex (true) or inserts directly (false).
+    /// When false, `absorb_shards` is skipped after reference indexing.
+    fn needs_absorb(&self) -> bool;
 }
 
 pub struct HashShards {
@@ -39,7 +43,7 @@ impl KmerStore for HashShards {
         self.index[idx].insert(*kmer);
     }
 
-    /// Check which shard would contain the k-mer.
+    /// Hash k-mer and return shard index.
     #[inline(always)]
     fn map(&self, kmer: &u64) -> usize {
         let hashed = kmer ^ (kmer >> 12);
@@ -75,6 +79,10 @@ impl KmerStore for HashShards {
         self.index = shards;
     }
 
+    fn needs_absorb(&self) -> bool {
+        true
+    }
+
     /// Add serialized k-mers to reference index.
     fn from_serialized(&mut self, data: Vec<Vec<u64>>) {
         self.index
@@ -100,107 +108,411 @@ impl HashShards {
     }
 }
 
+/// Compute optimal blocked bloom filter parameters for `n` items at target `fpr`.
+/// Returns (num_blocks, n_hashes). Each block is 512 bits (1 cache line).
+pub fn bloom_params(n: usize, fpr: f64) -> (usize, u8) {
+    let n = n.max(64) as f64;
+    let m_raw = (-(n * fpr.ln()) / (2.0f64.ln().powi(2))).ceil() as u64;
+    let k_h = ((m_raw as f64 / n) * 2.0f64.ln()).round() as u8;
+    let k_h = k_h.max(1).min(8);
+    let num_blocks_raw = ((m_raw + 511) / 512).max(1);
+    let num_blocks = num_blocks_raw.next_power_of_two() as usize;
+    (num_blocks, k_h)
+}
+
+/// Compute per-k-mer FPR from per-read FPR, assuming ~150bp reads.
+pub fn per_kmer_fpr(read_fpr: f64, k: usize) -> f64 {
+    let queries_per_read = 150usize.saturating_sub(k).max(1) + 1;
+    1.0 - (1.0 - read_fpr).powf(1.0 / queries_per_read as f64)
+}
+
+/// Two independent hash values for bloom filter probing.
+/// Uses multiply + add + xor-shift to ensure full-width entropy
+/// (needed for bit-extraction probing where every 9-bit window matters).
+#[inline(always)]
+fn bloom_hash(item: u64) -> (u64, u64) {
+    let mut h1 = item
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x9E3779B97F4A7C15);
+    h1 ^= h1 >> 17;
+    let mut h2 = item
+        .wrapping_mul(0xBF58476D1CE4E5B9)
+        .wrapping_add(0xBF58476D1CE4E5B9);
+    h2 ^= h2 >> 17;
+    (h1, h2)
+}
+
+/// Issue a prefetch for the given address into L1 cache.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+}
+
+/// Cache-line blocked bloom filter.
+///
+/// Each block is 512 bits (8 × u64 = 1 cache line). Queries touch exactly
+/// one block, so each lookup is a single cache-line fetch from DRAM.
 pub struct MiniBloom {
-    index: Vec<AtomicU64>,
-    mask: u64,
-    count: AtomicUsize,
+    data: Vec<AtomicU64>,
+    num_blocks_mask: u64,
+    pub num_hashes: u32,
+    pub num_bits: u64,
+    count: usize,
+}
+
+unsafe impl Send for MiniBloom {}
+unsafe impl Sync for MiniBloom {}
+
+impl MiniBloom {
+    /// Extract a 9-bit probe position from pre-mixed hash values.
+    /// Probes 0–6 use non-overlapping 9-bit windows of h2 (63 bits).
+    /// Probes 7+ use upper bits of h1 (above block-selection bits).
+    #[inline(always)]
+    fn extract_probe(h2: u64, h1_upper: u64, i: u32) -> u64 {
+        if i < 7 {
+            (h2 >> (i * 9)) & 511
+        } else {
+            (h1_upper >> ((i - 7) * 9)) & 511
+        }
+    }
+
+    /// Number of 512-bit blocks in this filter.
+    #[inline(always)]
+    pub fn num_blocks(&self) -> usize {
+        (self.num_blocks_mask + 1) as usize
+    }
+
+    /// Compute hash, issue prefetch for the target block, return prehashed state.
+    #[inline(always)]
+    pub fn hash_and_prefetch(&self, item: u64) -> (usize, u64, u64) {
+        let (h1, h2) = bloom_hash(item);
+        let block_start = ((h1 & self.num_blocks_mask) as usize) << 3;
+        let h1_upper = h1 >> (self.num_blocks_mask + 1).trailing_zeros();
+        let ptr = unsafe { self.data.as_ptr().add(block_start) };
+        prefetch_read(ptr as *const u8);
+        (block_start, h2, h1_upper)
+    }
+
+    /// Insert an item using atomic operations (safe to call from &self).
+    #[inline(always)]
+    pub fn insert_prehashed_item(&self, item: u64) {
+        let (h1, h2) = bloom_hash(item);
+        let block_start = ((h1 & self.num_blocks_mask) as usize) << 3;
+        let h1_upper = h1 >> (self.num_blocks_mask + 1).trailing_zeros();
+        self.insert_prehashed(block_start, h2, h1_upper);
+    }
+
+    /// Insert with compile-time-known hash count for full loop unrolling.
+    #[inline(always)]
+    fn insert_prehashed_unrolled<const HASHES: u32>(
+        &self,
+        block_start: usize,
+        h2: u64,
+        h1_upper: u64,
+    ) {
+        for i in 0..HASHES {
+            let bit_pos = Self::extract_probe(h2, h1_upper, i);
+            let word_idx = (bit_pos >> 6) as usize;
+            let bit_mask = 1u64 << (bit_pos & 63);
+            unsafe { self.data.get_unchecked(block_start + word_idx) }
+                .fetch_or(bit_mask, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Query with compile-time-known hash count for full loop unrolling.
+    #[inline(always)]
+    fn contains_prehashed_unrolled<const HASHES: u32>(
+        &self,
+        block_start: usize,
+        h2: u64,
+        h1_upper: u64,
+    ) -> bool {
+        for i in 0..HASHES {
+            let bit_pos = Self::extract_probe(h2, h1_upper, i);
+            let word_idx = (bit_pos >> 6) as usize;
+            let bit_mask = 1u64 << (bit_pos & 63);
+            if unsafe {
+                self.data
+                    .get_unchecked(block_start + word_idx)
+                    .load(AtomicOrdering::Relaxed)
+            } & bit_mask
+                == 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Insert using pre-computed hash values (block already prefetched).
+    /// Dispatches to a const-generic monomorphized version so LLVM can fully
+    /// unroll the probe loop and resolve all shift amounts at compile time.
+    #[inline(always)]
+    pub fn insert_prehashed(&self, block_start: usize, h2: u64, h1_upper: u64) {
+        match self.num_hashes {
+            1 => self.insert_prehashed_unrolled::<1>(block_start, h2, h1_upper),
+            2 => self.insert_prehashed_unrolled::<2>(block_start, h2, h1_upper),
+            3 => self.insert_prehashed_unrolled::<3>(block_start, h2, h1_upper),
+            4 => self.insert_prehashed_unrolled::<4>(block_start, h2, h1_upper),
+            5 => self.insert_prehashed_unrolled::<5>(block_start, h2, h1_upper),
+            6 => self.insert_prehashed_unrolled::<6>(block_start, h2, h1_upper),
+            7 => self.insert_prehashed_unrolled::<7>(block_start, h2, h1_upper),
+            _ => self.insert_prehashed_unrolled::<8>(block_start, h2, h1_upper),
+        }
+    }
+
+    /// Query using pre-computed hash values (block already prefetched).
+    /// Dispatches to a const-generic monomorphized version so LLVM can fully
+    /// unroll the probe loop and resolve all shift amounts at compile time.
+    #[inline(always)]
+    pub fn contains_prehashed(&self, block_start: usize, h2: u64, h1_upper: u64) -> bool {
+        match self.num_hashes {
+            1 => self.contains_prehashed_unrolled::<1>(block_start, h2, h1_upper),
+            2 => self.contains_prehashed_unrolled::<2>(block_start, h2, h1_upper),
+            3 => self.contains_prehashed_unrolled::<3>(block_start, h2, h1_upper),
+            4 => self.contains_prehashed_unrolled::<4>(block_start, h2, h1_upper),
+            5 => self.contains_prehashed_unrolled::<5>(block_start, h2, h1_upper),
+            6 => self.contains_prehashed_unrolled::<6>(block_start, h2, h1_upper),
+            7 => self.contains_prehashed_unrolled::<7>(block_start, h2, h1_upper),
+            _ => self.contains_prehashed_unrolled::<8>(block_start, h2, h1_upper),
+        }
+    }
+
+    /// Compute per-block fill statistics: (avg_fill, min_fill, max_fill).
+    pub fn fill_stats(&self) -> (f64, f64, f64) {
+        let num_blocks = self.num_blocks();
+        let mut total_bits_set = 0u64;
+        let mut min_block = 512u32;
+        let mut max_block = 0u32;
+        for b in 0..num_blocks {
+            let base = b * 8;
+            let mut block_bits = 0u32;
+            for w in 0..8 {
+                block_bits += self.data[base + w]
+                    .load(AtomicOrdering::Relaxed)
+                    .count_ones();
+            }
+            total_bits_set += block_bits as u64;
+            min_block = min_block.min(block_bits);
+            max_block = max_block.max(block_bits);
+        }
+        let avg = total_bits_set as f64 / (num_blocks as f64 * 512.0);
+        let min_f = min_block as f64 / 512.0;
+        let max_f = max_block as f64 / 512.0;
+        (avg, min_f, max_f)
+    }
+
+    /// Persist bloom filter to disk in nucleaze binary format.
+    pub fn save(&self, path: &str, k: u64, kmer_count: u64) -> std::io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        w.write_all(b"NBLM")?;
+        w.write_all(&2u32.to_le_bytes())?; // version 2 = blocked
+        w.write_all(&(self.num_blocks() as u64).to_le_bytes())?;
+        w.write_all(&self.num_hashes.to_le_bytes())?;
+        w.write_all(&k.to_le_bytes())?;
+        w.write_all(&kmer_count.to_le_bytes())?;
+        for word in &self.data {
+            w.write_all(&word.load(AtomicOrdering::Relaxed).to_le_bytes())?;
+        }
+        w.flush()
+    }
+
+    /// Load bloom filter from nucleaze binary format.
+    pub fn load(path: &str) -> std::io::Result<(Self, u64, u64)> {
+        let mut r = BufReader::new(File::open(path)?);
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if &magic != b"NBLM" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not a nucleaze bloom file",
+            ));
+        }
+        let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf4)?; // version
+        r.read_exact(&mut buf8)?;
+        let num_blocks = u64::from_le_bytes(buf8) as usize;
+        r.read_exact(&mut buf4)?;
+        let num_hashes = u32::from_le_bytes(buf4);
+        r.read_exact(&mut buf8)?;
+        let k = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf8)?;
+        let kmer_count = u64::from_le_bytes(buf8);
+
+        let total_words = num_blocks * 8;
+        let mut data = Vec::with_capacity(total_words);
+        for _ in 0..total_words {
+            r.read_exact(&mut buf8)?;
+            data.push(AtomicU64::new(u64::from_le_bytes(buf8)));
+        }
+
+        Ok((
+            MiniBloom {
+                data,
+                num_blocks_mask: num_blocks as u64 - 1,
+                num_hashes,
+                num_bits: (num_blocks * 512) as u64,
+                count: kmer_count as usize,
+            },
+            k,
+            kmer_count,
+        ))
+    }
 }
 
 impl KmerStore for MiniBloom {
-    // Create a new Bloom filter sized for the number of items and fpr.
     fn new(size: usize, fpr: f64) -> Self {
-        // Compute number of u64 words needed for optimal Bloom filter size.
-        // m_bits = -(n * ln(p)) / (ln2)^2, then divide by 64 for u64 count.
-        fn compute_size(n: usize, fpp: f64) -> usize {
-            use std::f64::consts::LN_2;
-            let ln2_2 = (LN_2 as f64) * (LN_2 as f64);
-            let m_bits = -((n as f64) * f64::ln(fpp)) / ln2_2;
-            (m_bits / 64.0).ceil().max(1.0) as usize
-        }
-        let num_idx = compute_size(size, fpr);
-        println!("Number of indices in Bloom filter: {}", num_idx);
+        let (num_blocks, num_hashes) = bloom_params(size, fpr);
+        let total_words = num_blocks * 8;
+        let num_bits = (num_blocks * 512) as u64;
+
+        println!(
+            "Bloom filter: {} bits ({:.1} MB), {} hash functions, {} blocks",
+            num_bits,
+            total_words as f64 * 8.0 / 1_000_000.0,
+            num_hashes,
+            num_blocks,
+        );
 
         MiniBloom {
-            index: (0..num_idx).map(|_| AtomicU64::new(0)).collect(),
-            mask: (num_idx as u64 * 64 - 1),
-            count: AtomicUsize::new(0),
+            data: (0..total_words).map(|_| AtomicU64::new(0)).collect(),
+            num_blocks_mask: num_blocks as u64 - 1,
+            num_hashes: num_hashes as u32,
+            num_bits,
+            count: 0,
         }
     }
 
-    /// Find k-mer's Bloom index.
+    /// Shard index for subindex buffering (not used for bloom bit positions).
     fn map(&self, kmer: &u64) -> usize {
-        (kmer & self.mask) as usize
+        let hashed = kmer ^ (kmer >> 12);
+        hashed as usize & 1023
     }
 
-    /// O(1) Bloom filter insert.
+    /// Insert k-mer by setting bits in a single cache-line block.
     fn insert(&mut self, kmer: &u64) {
-        let pos = kmer & self.mask;
-        let i = (pos / 64) as usize;
-        self.index[i].fetch_or(1 << (pos % 64), Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let (h1, h2) = bloom_hash(*kmer);
+        let block_start = ((h1 & self.num_blocks_mask) as usize) << 3;
+        let h1_upper = h1 >> (self.num_blocks_mask + 1).trailing_zeros();
+        for i in 0..self.num_hashes {
+            let bit_pos = Self::extract_probe(h2, h1_upper, i);
+            let word_idx = (bit_pos >> 6) as usize;
+            let bit_mask = 1u64 << (bit_pos & 63);
+            self.data[block_start + word_idx].fetch_or(bit_mask, AtomicOrdering::Relaxed);
+        }
+        self.count += 1;
     }
 
-    /// Insertion wrapper.
-    fn stage(&self, kmer: u64, _subindex: &mut Vec<Vec<u64>>) {
-        let pos = kmer & self.mask;
-        let i = (pos / 64) as usize;
-        self.index[i].fetch_or(1 << (pos % 64), Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+    /// Buffer k-mer into subindex for later batch insertion.
+    fn stage(&self, kmer: u64, subindex: &mut Vec<Vec<u64>>) {
+        let idx = self.map(&kmer);
+        subindex[idx].push(kmer);
     }
 
-    /// O(1) Bloom filter query.
+    /// Query bloom filter: all probes hit the same cache-line block.
+    /// Early-exits on first missing bit.
     fn contains(&self, kmer: &u64) -> bool {
-        let pos = self.map(kmer);
-        let idx = (pos / 64) as usize;
-        self.index[idx].load(Ordering::Relaxed) & (1 << (pos % 64)) != 0
+        let (h1, h2) = bloom_hash(*kmer);
+        let block_start = ((h1 & self.num_blocks_mask) as usize) << 3;
+        let h1_upper = h1 >> (self.num_blocks_mask + 1).trailing_zeros();
+        for i in 0..self.num_hashes {
+            let bit_pos = Self::extract_probe(h2, h1_upper, i);
+            let word_idx = (bit_pos >> 6) as usize;
+            let bit_mask = 1u64 << (bit_pos & 63);
+            if unsafe {
+                self.data
+                    .get_unchecked(block_start + word_idx)
+                    .load(AtomicOrdering::Relaxed)
+            } & bit_mask
+                == 0
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Clear Bloom filter.
     fn clear(&mut self) {
-        for kmer in self.index.iter() {
-            kmer.store(0, Ordering::Relaxed);
+        for word in &self.data {
+            word.store(0, AtomicOrdering::Relaxed);
         }
-        self.count.store(0, Ordering::Relaxed);
+        self.count = 0;
     }
 
     /// Return k-mer counter.
     fn count(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.count
     }
 
-    /// Add serialized k-mers to Bloom filter.
+    /// Add serialized k-mers to Bloom filter (parallel).
     fn from_serialized(&mut self, data: Vec<Vec<u64>>) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let idx: &[AtomicU64] = unsafe {
-            std::slice::from_raw_parts(self.index.as_ptr() as *const AtomicU64, self.index.len())
-        };
-        let total = data
+        let num_blocks_mask = self.num_blocks_mask;
+        let num_hashes = self.num_hashes;
+        let bloom_data = &self.data;
+
+        let total: usize = data
             .par_iter()
             .map(|shard| {
                 for kmer in shard {
-                    let pos = self.map(kmer);
-                    let i = (pos / 64) as usize;
-                    // Atomic insertion process
-                    idx[i].fetch_or(1 << (pos % 64), Ordering::Relaxed);
+                    let (h1, h2) = bloom_hash(*kmer);
+                    let block_start = ((h1 & num_blocks_mask) as usize) << 3;
+                    let h1_upper = h1 >> (num_blocks_mask + 1).trailing_zeros();
+                    for i in 0..num_hashes {
+                        let bit_pos = MiniBloom::extract_probe(h2, h1_upper, i);
+                        let word_idx = (bit_pos >> 6) as usize;
+                        let bit_mask = 1u64 << (bit_pos & 63);
+                        unsafe { bloom_data.get_unchecked(block_start + word_idx) }
+                            .fetch_or(bit_mask, AtomicOrdering::Relaxed);
+                    }
                 }
                 shard.len()
             })
             .sum();
-        self.count.fetch_add(total, Ordering::Relaxed);
+        self.count += total;
     }
 
-    /// Absorb pre-sharded sets by inserting each k-mer into the Bloom filter.
+    /// Insert all buffered k-mers from the sharded accumulator into the Bloom filter (parallel).
     fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>) {
-        for set in shards {
-            for kmer in set {
-                self.insert(&kmer);
-            }
-        }
+        let num_blocks_mask = self.num_blocks_mask;
+        let num_hashes = self.num_hashes;
+        let bloom_data = &self.data;
+
+        let total: usize = shards
+            .par_iter()
+            .map(|set| {
+                for &kmer in set {
+                    let (h1, h2) = bloom_hash(kmer);
+                    let block_start = ((h1 & num_blocks_mask) as usize) << 3;
+                    let h1_upper = h1 >> (num_blocks_mask + 1).trailing_zeros();
+                    for i in 0..num_hashes {
+                        let bit_pos = MiniBloom::extract_probe(h2, h1_upper, i);
+                        let word_idx = (bit_pos >> 6) as usize;
+                        let bit_mask = 1u64 << (bit_pos & 63);
+                        unsafe { bloom_data.get_unchecked(block_start + word_idx) }
+                            .fetch_or(bit_mask, AtomicOrdering::Relaxed);
+                    }
+                }
+                set.len()
+            })
+            .sum();
+        self.count += total;
+    }
+
+    fn needs_absorb(&self) -> bool {
+        true
     }
 }
 
 /// K-mer encoding, storage, and sequence processing operations
-#[derive(Clone)]
 pub struct KmerProcessor<S: KmerStore> {
     pub k: usize,
     pub k_cap: u64,
@@ -319,6 +631,131 @@ impl<S: KmerStore> KmerProcessor<S> {
     // KmerProcessor wrapper for KmerStore::count().
     pub fn num_kmers(&self) -> usize {
         self.ref_kmers.count()
+    }
+
+    pub fn needs_absorb(&self) -> bool {
+        self.ref_kmers.needs_absorb()
+    }
+}
+
+impl KmerProcessor<MiniBloom> {
+    /// Extract k-mers from a sequence and insert them into the bloom filter.
+    /// Uses software-pipelined prefetch: hash+prefetch one k-mer ahead so the
+    /// cache line is warm by the time we actually write the bits.
+    #[inline(always)]
+    pub fn insert_kmers_bloom(&self, seq: &[u8]) -> u64 {
+        let bloom = &self.ref_kmers;
+        let mut kmer = 0u64;
+        let mut rc_kmer = 0u64;
+        let mut valid_bases = 0usize;
+        let mut count = 0u64;
+        let rc_shift = 2 * (self.k - 1);
+        let mut pending: Option<(usize, u64, u64)> = None;
+
+        for &base in seq {
+            if let Some(bits) = encode(base) {
+                kmer = ((kmer << 2) | bits) & self.k_cap;
+                rc_kmer = (rc_kmer >> 2) | ((bits ^ 3) << rc_shift);
+                valid_bases += 1;
+
+                if valid_bases >= self.k {
+                    // Flush pending insert (block should be in L1 now)
+                    if let Some((bs, h2, h1u)) = pending {
+                        bloom.insert_prehashed(bs, h2, h1u);
+                        count += 1;
+                    }
+
+                    let canonical = if self.use_canonical {
+                        std::cmp::min(kmer, rc_kmer)
+                    } else {
+                        kmer
+                    };
+                    pending = Some(bloom.hash_and_prefetch(canonical));
+                }
+            } else {
+                if let Some((bs, h2, h1u)) = pending.take() {
+                    bloom.insert_prehashed(bs, h2, h1u);
+                    count += 1;
+                }
+                kmer = 0;
+                rc_kmer = 0;
+                valid_bases = 0;
+            }
+        }
+        // Flush final pending insert
+        if let Some((bs, h2, h1u)) = pending {
+            bloom.insert_prehashed(bs, h2, h1u);
+            count += 1;
+        }
+        count
+    }
+
+    /// Bloom path: software-pipelined prefetch defers the membership check
+    /// by one k-mer so the cache line fetch overlaps with useful work.
+    #[inline(always)]
+    pub fn process_read_bloom(&self, seq: &[u8]) -> bool {
+        if seq.len() < self.k {
+            return false;
+        }
+        let bloom = &self.ref_kmers;
+        let mut hits: u8 = 0;
+        let mut kmer: u64 = 0;
+        let mut rc_kmer: u64 = 0;
+        let mut valid_bases: usize = 0;
+        let rc_shift = 2 * (self.k - 1);
+        let mut pending: Option<(usize, u64, u64)> = None;
+
+        for &base in seq {
+            match encode(base) {
+                Some(bits) => {
+                    kmer = ((kmer << 2) | bits) & self.k_cap;
+                    rc_kmer = (rc_kmer >> 2) | ((bits ^ 3) << rc_shift);
+                    valid_bases += 1;
+
+                    if valid_bases >= self.k {
+                        // Check pending contains (block should be in L1 now)
+                        if let Some((bs, h2, h1u)) = pending {
+                            if bloom.contains_prehashed(bs, h2, h1u) {
+                                hits += 1;
+                                if hits >= self.threshold {
+                                    return true;
+                                }
+                            }
+                        }
+
+                        let canonical = if self.use_canonical {
+                            std::cmp::min(kmer, rc_kmer)
+                        } else {
+                            kmer
+                        };
+                        pending = Some(bloom.hash_and_prefetch(canonical));
+                    }
+                }
+                None => {
+                    if let Some((bs, h2, h1u)) = pending.take() {
+                        if bloom.contains_prehashed(bs, h2, h1u) {
+                            hits += 1;
+                            if hits >= self.threshold {
+                                return true;
+                            }
+                        }
+                    }
+                    valid_bases = 0;
+                    kmer = 0;
+                    rc_kmer = 0;
+                }
+            }
+        }
+        // Check final pending
+        if let Some((bs, h2, h1u)) = pending {
+            if bloom.contains_prehashed(bs, h2, h1u) {
+                hits += 1;
+                if hits >= self.threshold {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

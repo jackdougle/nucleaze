@@ -1109,7 +1109,7 @@ fn test_bloom_filter_basic_matching() {
 }
 
 #[test]
-fn test_bloom_filter_rejects_saveref() {
+fn test_bloom_filter_saveref() {
     let temp = TempDir::new().unwrap();
     let ref_path = temp.path().join("ref.fa");
     let reads_path = temp.path().join("reads.fq");
@@ -1141,12 +1141,11 @@ fn test_bloom_filter_rejects_saveref() {
         .arg(&saveref_path)
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "serialization is not supported in bloom filter mode",
-        ));
+        .stdout(predicate::str::contains("Saved bloom filter to"));
 
-    // Verify no binary index was created
-    assert!(!saveref_path.exists());
+    // Verify bloom index was created
+    let nkb_path = temp.path().join("index.bin.nkb");
+    assert!(nkb_path.exists());
 }
 
 #[test]
