@@ -112,10 +112,15 @@ impl HashShards {
 /// Returns (num_blocks, n_hashes). Each block is 512 bits (1 cache line).
 pub fn bloom_params(n: usize, fpr: f64) -> (usize, u8) {
     let n = n.max(64) as f64;
-    let m_raw = (-(n * fpr.ln()) / (2.0f64.ln().powi(2))).ceil() as u64;
-    let k_h = ((m_raw as f64 / n) * 2.0f64.ln()).round() as u8;
+    let m_standard = (-(n * fpr.ln()) / (2.0f64.ln().powi(2))).ceil() as u64;
+    // 2x correction for cache-line blocked bloom filter: all probes for one item
+    // target the same 512-bit block, so block occupancy follows a Poisson distribution.
+    // By Jensen's inequality the average FPR exceeds the FPR at mean occupancy;
+    // doubling the bit count compensates (Putze, Sanders, Singler 2007).
+    let m_corrected = m_standard * 2;
+    let k_h = ((m_corrected as f64 / n) * 2.0f64.ln()).round() as u8;
     let k_h = k_h.max(1).min(8);
-    let num_blocks_raw = ((m_raw + 511) / 512).max(1);
+    let num_blocks_raw = ((m_corrected + 511) / 512).max(1);
     let num_blocks = num_blocks_raw.next_power_of_two() as usize;
     (num_blocks, k_h)
 }

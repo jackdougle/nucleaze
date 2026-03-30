@@ -40,20 +40,33 @@ Optimal k is computed automatically: `k = (m/n) * ln(2)`. For 100M k-mers at 1% 
 
 ---
 
-## Note on per-read FPR
+## Blocked bloom filter FPR correction
 
-The `--fpr` flag controls per-k-mer false positive rate. Per-read FPR compounds across all k-mers checked in a read:
+**Problem**: `bloom_params` used the standard (non-blocked) bloom filter sizing
+formula `m = -(n * ln(fpr)) / (ln(2))^2`. In a cache-line blocked filter where
+all probes for one item target the same 512-bit block, items are Poisson-distributed
+across blocks. Overloaded blocks dominate the aggregate FPR (Jensen's inequality),
+causing 3-4x higher FPR than the formula predicts.
+
+**Fix**: Applied a 2x correction factor to the bit count before computing block
+count and hash count. This is the standard approach for cache-line blocked bloom
+filters (Putze, Sanders, Singler 2007). Memory usage doubles but remains small
+relative to the input data.
+
+---
+
+## Note on --fpr semantics
+
+The `--fpr` flag controls the **per-read** false positive rate target. Internally,
+this is converted to a per-k-mer FPR using:
 
 ```
-per_read_FPR = 1 - (1 - per_kmer_FPR)^num_kmers
+per_kmer_fpr = 1 - (1 - per_read_fpr)^(1 / num_kmers_per_read)
 ```
 
-For 150bp reads with k=21 (~130 k-mers) and `--fpr 0.01`:
+where `num_kmers_per_read` is estimated as `150 - k + 1` for a typical 150bp read.
 
-```
-per_read_FPR = 1 - 0.99^130 = 73%
-```
-
-Mitigations:
+For low hit-rate scenarios with `--minhits 1`, even a small per-read FPR can cause
+poor precision (many false positives among reported hits). Mitigations:
 - Increase `--minhits` (e.g., 2-3) so a single FP k-mer doesn't trigger a match
-- Lower `--fpr` (increases memory: 0.001 uses ~2x memory and ~15 hash functions)
+- Lower `--fpr` (increases memory)
