@@ -39,14 +39,61 @@ impl Display for InputSource {
     }
 }
 
+/// A fixed pool of permits, used as a counting semaphore to bound how many chunk
+/// arenas are alive at once (from creation through write). Pre-filled with
+/// `capacity` tokens; `acquire` blocks until one is free.
+struct PermitPool {
+    tx: Sender<()>,
+    rx: crossbeam::channel::Receiver<()>,
+}
+
+impl PermitPool {
+    fn new(capacity: usize) -> Self {
+        let (tx, rx) = bounded::<()>(capacity);
+        for _ in 0..capacity {
+            tx.send(()).expect("prefill permit pool"); // capacity == tokens, never blocks
+        }
+        PermitPool { tx, rx }
+    }
+
+    fn acquire(&self) -> ChunkPermit {
+        self.rx.recv().expect("chunk permit pool disconnected");
+        ChunkPermit { pool: self.tx.clone() }
+    }
+}
+
+/// One permit per in-flight chunk. Carried inside its `SequenceChunk`, so `Drop`
+/// returns the token to the pool only after the chunk is written (and, in `--order`
+/// mode, only after it leaves the reorder heap).
+struct ChunkPermit {
+    pool: Sender<()>,
+}
+
+impl Drop for ChunkPermit {
+    fn drop(&mut self) {
+        // Never blocks: a live guard means its slot is outstanding, so the pool has
+        // room. The send error once the receiver is gone (run finished) is ignored.
+        let _ = self.pool.send(());
+    }
+}
+
 /// A chunk of sequences with their match results
-#[derive(Eq, PartialEq)]
 struct SequenceChunk {
     id: u32,
     data_arena: Vec<u8>,                          // raw bytes for all sequences
     offsets: Vec<(u32, u32, u32, u32, u32, u32)>, // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
     matches: Vec<bool>,                           // k-mer match results
+    _permit: ChunkPermit,                         // returned to the permit pool on drop (after write)
 }
+
+// Equality is by `id` only (matching the id-only `Ord`); the permit guard is not comparable.
+impl PartialEq for SequenceChunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for SequenceChunk {}
 
 // Implement Ord for BinaryHeap to support ordered output
 impl Ord for SequenceChunk {
@@ -594,6 +641,11 @@ fn process_reads(
     let (chunk_sender, chunk_receiver): (SyncSender<SequenceChunk>, Receiver<SequenceChunk>) =
         sync_channel(20);
 
+    // Bound how many chunk arenas are alive at once (creation through write) so peak
+    // memory is flat in input size instead of growing when the reader outruns the
+    // writer. Sized from the thread count; see the stack-overflow/memory design note.
+    let permit_pool = PermitPool::new(rayon::current_num_threads() + 24);
+
     let chunk_pos = Arc::new(AtomicU32::new(0));
 
     // Extract file extensions
@@ -625,36 +677,42 @@ fn process_reads(
         let mut arena: Vec<u8> = Vec::with_capacity(ARENA_CAPACITY);
         let mut offsets: Vec<(u32, u32, u32, u32, u32, u32)> = Vec::with_capacity(CHUNK_SIZE);
 
-        // Dispatch filled arena to Rayon for parallel k-mer processing
-        let process_arena =
-            |local_arena: Vec<u8>, local_offsets: Vec<(u32, u32, u32, u32, u32, u32)>| {
-                let read_fn = read_fn.clone();
-                let sender = parallel_sender.clone();
-                let current_chunk_pos = parellel_chunk_pos.fetch_add(1, AtomicOrdering::SeqCst);
+        // Dispatch a filled arena to Rayon for k-mer processing. The permit for the
+        // arena is moved in and rides on the resulting chunk until it is written.
+        let process_arena = |local_arena: Vec<u8>,
+                             local_offsets: Vec<(u32, u32, u32, u32, u32, u32)>,
+                             permit: ChunkPermit| {
+            let read_fn = read_fn.clone();
+            let sender = parallel_sender.clone();
+            let current_chunk_pos = parellel_chunk_pos.fetch_add(1, AtomicOrdering::SeqCst);
 
-                rayon::spawn(move || {
-                    // Parallel k-mer matching: map over offsets to create slices into arena
-                    // This avoids copying sequence data
-                    let matches: Vec<bool> = local_offsets
-                        .par_iter()
-                        .map(|(_, _, seq_start, seq_len, _, _)| {
-                            let seq =
-                                &local_arena[*seq_start as usize..(*seq_start + *seq_len) as usize];
-                            read_fn(seq)
-                        })
-                        .collect();
+            rayon::spawn(move || {
+                // k-mer matching: map over offsets to slice into the arena (avoids
+                // copying sequence data). Matching is sequential within a chunk;
+                // parallelism comes from many chunks dispatched across the pool.
+                // Keeping it sequential avoids nested Rayon join/collect, whose
+                // work-stealing-while-blocked can amplify worker stack depth.
+                let matches: Vec<bool> = local_offsets
+                    .iter()
+                    .map(|(_, _, seq_start, seq_len, _, _)| {
+                        let seq =
+                            &local_arena[*seq_start as usize..(*seq_start + *seq_len) as usize];
+                        read_fn(seq)
+                    })
+                    .collect();
 
-                    let chunk = SequenceChunk {
-                        id: current_chunk_pos,
-                        data_arena: local_arena,
-                        offsets: local_offsets,
-                        matches,
-                    };
+                let chunk = SequenceChunk {
+                    id: current_chunk_pos,
+                    data_arena: local_arena,
+                    offsets: local_offsets,
+                    matches,
+                    _permit: permit,
+                };
 
-                    // Blocks if channel is full (backpressure)
-                    let _ = sender.send(chunk);
-                });
-            };
+                // Blocks if channel is full (backpressure)
+                let _ = sender.send(chunk);
+            });
+        };
 
         // Add one record to the arena
         let push_record =
@@ -678,6 +736,11 @@ fn process_reads(
                 offsets.push((id_start, id_len, seq_start, seq_len, qual_start, qual_len));
             };
 
+        // Hold a permit for the arena currently being filled (including the first and
+        // final partial one), so even the in-progress arena is inside the budget.
+        // This blocks when the pool is exhausted, throttling chunk creation.
+        let mut permit = permit_pool.acquire();
+
         // Read and chunk sequences based on mode
         if process_mode == ProcessMode::Unpaired
             || process_mode == ProcessMode::Interleaved
@@ -700,7 +763,8 @@ fn process_reads(
                     // Double buffering: swap buffers and dispatch filled one
                     let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
                     let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
-                    process_arena(local_arena, local_offsets);
+                    process_arena(local_arena, local_offsets, permit);
+                    permit = permit_pool.acquire(); // for the now-empty next arena
                 }
             }
         } else {
@@ -736,7 +800,8 @@ fn process_reads(
                                 mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
                             let local_offsets =
                                 mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
-                            process_arena(local_arena, local_offsets);
+                            process_arena(local_arena, local_offsets, permit);
+                            permit = permit_pool.acquire(); // for the now-empty next arena
                         }
                     }
                     (Some(_), None) => {
@@ -758,9 +823,11 @@ fn process_reads(
             }
         }
 
-        // Process remaining sequences
+        // Process remaining sequences, handing the last permit to the last chunk.
+        // If there are none, `permit` drops here and returns its token (the correct
+        // behavior for empty / zero-read input).
         if !offsets.is_empty() {
-            process_arena(arena, offsets);
+            process_arena(arena, offsets, permit);
         }
 
         Ok(())
