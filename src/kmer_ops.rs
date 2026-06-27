@@ -205,15 +205,6 @@ impl MiniBloom {
         (block_start, h2, h1_upper)
     }
 
-    /// Insert an item using atomic operations (safe to call from &self).
-    #[inline(always)]
-    pub fn insert_prehashed_item(&self, item: u64) {
-        let (h1, h2) = bloom_hash(item);
-        let block_start = ((h1 & self.num_blocks_mask) as usize) << 3;
-        let h1_upper = h1 >> (self.num_blocks_mask + 1).trailing_zeros();
-        self.insert_prehashed(block_start, h2, h1_upper);
-    }
-
     /// Insert with compile-time-known hash count for full loop unrolling.
     #[inline(always)]
     fn insert_prehashed_unrolled<const HASHES: u32>(
