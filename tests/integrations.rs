@@ -1210,8 +1210,8 @@ fn test_bloom_filter_large_ref_canonical() {
 
     // Reads: first 21 bases from ref_seq1 (exact match), and a non-matching read
     let matching_read: String = ref_seq1.chars().take(50).collect();
-    let nonmatching_read = "AAAAACCCCCGGGGGTTTTTAGAGAG".to_string()
-        + "TCTCTCAAAAACCCCCGGGGGTTTTTAGAGAG";
+    let nonmatching_read =
+        "AAAAACCCCCGGGGGTTTTTAGAGAG".to_string() + "TCTCTCAAAAACCCCCGGGGGTTTTTAGAGAG";
 
     {
         let mut f = File::create(&reads_path).unwrap();

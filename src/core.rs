@@ -58,7 +58,9 @@ impl PermitPool {
 
     fn acquire(&self) -> ChunkPermit {
         self.rx.recv().expect("chunk permit pool disconnected");
-        ChunkPermit { pool: self.tx.clone() }
+        ChunkPermit {
+            pool: self.tx.clone(),
+        }
     }
 }
 
@@ -83,7 +85,7 @@ struct SequenceChunk {
     data_arena: Vec<u8>,                          // raw bytes for all sequences
     offsets: Vec<(u32, u32, u32, u32, u32, u32)>, // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
     matches: Vec<bool>,                           // k-mer match results
-    _permit: ChunkPermit,                         // returned to the permit pool on drop (after write)
+    _permit: ChunkPermit, // returned to the permit pool on drop (after write)
 }
 
 // Equality is by `id` only (matching the id-only `Ord`); the permit guard is not comparable.
