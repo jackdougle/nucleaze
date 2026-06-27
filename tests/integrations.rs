@@ -517,22 +517,35 @@ fn test_metadata_kmer_functional() {
     let ref_kmers: Vec<Vec<u64>> =
         decode_from_std_read(&mut reader, config::standard().with_fixed_int_encoding()).unwrap();
 
+    // k is recorded in the index as a sentinel "k-mer" equal to `u64::MAX ^ k`,
+    // stored in the same shards as real k-mers. Real k-mers are 2-bit packed into
+    // the low 2*k bits, so for k <= 31 the sentinel's high bits keep it disjoint
+    // from every real k-mer and no collision is possible. The docs advertise k in
+    // 1..=31, but the CLI only rejects k > 32, so k == 32 is accepted in code; at
+    // k == 32 a real k-mer spans all 64 bits and could in principle equal the
+    // sentinel — a remote collision the scheme does not currently guard against.
     let size_metadata = u64::MAX ^ k as u64;
-    assert!(ref_kmers[0].contains(&size_metadata));
+    // The sentinel is hashed into one of the index shards, so search all shards
+    // rather than assuming it lands in a specific one.
+    assert!(
+        ref_kmers.iter().any(|shard| shard.contains(&size_metadata)),
+        "saved index should contain the k={} metadata sentinel",
+        k
+    );
 
     nucleaze_cmd()
         .arg("--in")
         .arg(&reads_path)
-        .arg("--ref")
-        .arg(&ref_path)
         .arg("--outm")
         .arg(&matched_path)
         .arg("--outu")
         .arg(&unmatched_path)
         .arg("--k")
-        .arg("6".to_string()) // metadata is set for k = 5
+        .arg("6".to_string()) // saved index carries the k=5 sentinel
         .arg("--binref")
         .arg(&saveref_path)
+        // No --ref fallback: the k=6 request rejects the k=5 index, and with no
+        // reference to rebuild from the run must fail.
         .assert()
         .failure();
 }
