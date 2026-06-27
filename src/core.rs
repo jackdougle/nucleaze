@@ -64,17 +64,21 @@ impl PermitPool {
     }
 }
 
-/// One permit per in-flight chunk. Carried inside its `SequenceChunk`, so `Drop`
-/// returns the token to the pool only after the chunk is written (and, in `--order`
-/// mode, only after it leaves the reorder heap).
+/// A permit for one in-flight chunk. Acquired from the `PermitPool` before the
+/// chunk's arena is filled and carried inside the `SequenceChunk`, so it is dropped
+/// only after the chunk is written (and, in `--order` mode, after it leaves the
+/// reorder heap). Dropping it returns the token to the pool — the backpressure that
+/// bounds how many chunks are in flight.
 struct ChunkPermit {
     pool: Sender<()>,
 }
 
 impl Drop for ChunkPermit {
     fn drop(&mut self) {
-        // Never blocks: a live guard means its slot is outstanding, so the pool has
-        // room. The send error once the receiver is gone (run finished) is ignored.
+        // Returning the token can't block: this guard holds one of the pool's slots,
+        // so there is always room. The result is ignored because at shutdown the
+        // reader thread drops the pool's `Receiver`, and the final chunks then return
+        // tokens that nothing will reuse.
         let _ = self.pool.send(());
     }
 }
@@ -644,8 +648,9 @@ fn process_reads(
         sync_channel(20);
 
     // Bound how many chunk arenas are alive at once (creation through write) so peak
-    // memory is flat in input size instead of growing when the reader outruns the
-    // writer. Sized from the thread count; see the stack-overflow/memory design note.
+    // memory stays flat in input size instead of growing when the reader outruns the
+    // writer. Sized as one arena per worker plus headroom for the output channel and
+    // the reorder heap.
     let permit_pool = PermitPool::new(rayon::current_num_threads() + 24);
 
     let chunk_pos = Arc::new(AtomicU32::new(0));
@@ -738,9 +743,9 @@ fn process_reads(
                 offsets.push((id_start, id_len, seq_start, seq_len, qual_start, qual_len));
             };
 
-        // Hold a permit for the arena currently being filled (including the first and
-        // final partial one), so even the in-progress arena is inside the budget.
-        // This blocks when the pool is exhausted, throttling chunk creation.
+        // Acquire a permit for the arena we are about to fill, so the in-progress
+        // arena counts against the in-flight budget like the dispatched chunks do.
+        // Blocks when the pool is exhausted, throttling chunk creation.
         let mut permit = permit_pool.acquire();
 
         // Read and chunk sequences based on mode
