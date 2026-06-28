@@ -526,10 +526,8 @@ fn get_reference_kmers_bloom(
         return Err("reference file(s) contained no usable k-mers".into());
     }
 
-    // Insert metadata sentinel
-    processor
-        .ref_kmers
-        .insert_prehashed_item(u64::MAX ^ processor.k as u64);
+    // The k size is stored explicitly in the bloom file header (see MiniBloom::save),
+    // so no in-band sentinel is needed here.
 
     Ok(total_kmers)
 }
