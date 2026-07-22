@@ -15,11 +15,7 @@ pub trait KmerStore: Send + Sync {
     fn count(&self) -> usize;
     fn clear(&mut self);
     fn from_serialized(&mut self, data: Vec<Vec<u64>>);
-    /// Bulk-load pre-sharded k-mer sets from the reference indexing accumulator.
     fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>);
-    /// Whether `stage` buffers into the subindex (true) or inserts directly (false).
-    /// When false, `absorb_shards` is skipped after reference indexing.
-    fn needs_absorb(&self) -> bool;
 }
 
 pub struct HashShards {
@@ -77,10 +73,6 @@ impl KmerStore for HashShards {
     /// Absorb pre-sharded sets directly into the index.
     fn absorb_shards(&mut self, shards: Vec<FxHashSet<u64>>) {
         self.index = shards;
-    }
-
-    fn needs_absorb(&self) -> bool {
-        true
     }
 
     /// Add serialized k-mers to reference index.
@@ -507,10 +499,6 @@ impl KmerStore for MiniBloom {
             .sum();
         self.count += total;
     }
-
-    fn needs_absorb(&self) -> bool {
-        true
-    }
 }
 
 /// K-mer encoding, storage, and sequence processing operations
@@ -632,10 +620,6 @@ impl<S: KmerStore> KmerProcessor<S> {
     // KmerProcessor wrapper for KmerStore::count().
     pub fn num_kmers(&self) -> usize {
         self.ref_kmers.count()
-    }
-
-    pub fn needs_absorb(&self) -> bool {
-        self.ref_kmers.needs_absorb()
     }
 }
 
@@ -830,4 +814,709 @@ pub fn encode(b: u8) -> Option<u64> {
 
     let v = unsafe { *BASE_TABLE.get_unchecked(b as usize) };
     if v == 0xFF { None } else { Some(v as u64) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::min;
+    use std::io::Write;
+
+    fn encode_forward(seq: &[u8]) -> u64 {
+        seq.iter().fold(0, |encoded, &base| {
+            (encoded << 2) | encode(base).expect("invalid base in test sequence")
+        })
+    }
+
+    fn encode_reverse_complement(seq: &[u8]) -> u64 {
+        seq.iter().rev().fold(0, |encoded, &base| {
+            (encoded << 2) | (encode(base).expect("invalid base in test sequence") ^ 0b11)
+        })
+    }
+
+    fn k_cap_for(k: usize) -> u64 {
+        if k >= 32 {
+            u64::MAX
+        } else {
+            (1u64 << (k * 2)) - 1
+        }
+    }
+
+    fn kmer_bytes_from_bits(bits: u64, k: usize) -> Vec<u8> {
+        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        (0..k)
+            .map(|i| {
+                let shift = 2 * (k - 1 - i);
+                BASES[((bits >> shift) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// Mirrors the sliding-window logic in `process_read` and bloom paths.
+    fn sliding_kmer_windows(seq: &[u8], k: usize) -> Vec<(u64, u64)> {
+        let k_cap = k_cap_for(k);
+        let mut kmer = 0u64;
+        let mut rc_kmer = 0u64;
+        let mut valid = 0usize;
+        let mut windows = Vec::new();
+
+        for &base in seq {
+            if let Some(bits) = encode(base) {
+                kmer = ((kmer << 2) | bits) & k_cap;
+                let rc_base = bits ^ 0b11;
+                rc_kmer = (rc_kmer >> 2) | (rc_base << (2 * (k - 1)));
+                valid += 1;
+
+                if valid >= k {
+                    windows.push((kmer, rc_kmer));
+                }
+            } else {
+                kmer = 0;
+                rc_kmer = 0;
+                valid = 0;
+            }
+        }
+
+        windows
+    }
+
+    fn hash_processor(k: usize, threshold: u8, use_canonical: bool) -> KmerProcessor<HashShards> {
+        KmerProcessor::new(k, threshold, use_canonical, HashShards::new(0, 0.0))
+    }
+
+    /// Follow the same stage/deduplicate/absorb path used by reference indexing.
+    fn add_hash_references(processor: &mut KmerProcessor<HashShards>, seqs: &[&[u8]]) {
+        let mut staged = vec![Vec::new(); 1024];
+        for seq in seqs {
+            processor.process_ref(seq, &mut staged);
+        }
+        let shards = staged
+            .into_iter()
+            .map(|kmers| kmers.into_iter().collect::<FxHashSet<_>>())
+            .collect();
+        processor.ref_kmers.absorb_shards(shards);
+    }
+
+    fn bloom_processor(k: usize, threshold: u8, use_canonical: bool) -> KmerProcessor<MiniBloom> {
+        KmerProcessor::new(k, threshold, use_canonical, MiniBloom::new(10_000, 1e-9))
+    }
+
+    fn bloom_words(bloom: &MiniBloom) -> Vec<u64> {
+        bloom
+            .data
+            .iter()
+            .map(|word| word.load(AtomicOrdering::Relaxed))
+            .collect()
+    }
+
+    // Encoding and canonicalization
+
+    #[test]
+    fn encode_accepts_dna_rna_and_both_cases() {
+        for bases in [b"ACGT".as_slice(), b"acgt".as_slice()] {
+            assert_eq!(
+                bases.iter().map(|&b| encode(b)).collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(2), Some(3),]
+            );
+        }
+        assert_eq!(encode(b'U'), Some(3));
+        assert_eq!(encode(b'u'), Some(3));
+    }
+
+    #[test]
+    fn encode_rejects_ambiguous_and_non_base_bytes() {
+        for base in [b'N', b'n', b'-', b'X', 0, 0xff] {
+            assert_eq!(encode(base), None, "byte {base:#04x} should be invalid");
+        }
+    }
+
+    #[test]
+    fn forward_and_reverse_complement_encodings_have_expected_bits() {
+        let cases: &[(&[u8], u64, u64)] = &[
+            (b"A", 0b00, 0b11),
+            (b"C", 0b01, 0b10),
+            (b"G", 0b10, 0b01),
+            (b"T", 0b11, 0b00),
+            (b"AC", 0b0001, 0b1011),
+            (b"AT", 0b0011, 0b0011),
+            (b"ACGT", 0b00011011, 0b00011011),
+        ];
+
+        for &(seq, forward, reverse_complement) in cases {
+            assert_eq!(encode_forward(seq), forward, "forward encoding of {seq:?}");
+            assert_eq!(
+                encode_reverse_complement(seq),
+                reverse_complement,
+                "reverse-complement encoding of {seq:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_encoding_selects_the_smaller_strand() {
+        let seq = b"TTA";
+        let forward = encode_forward(seq);
+        let reverse_complement = encode_reverse_complement(seq);
+        assert_eq!(forward, 0b111100);
+        assert_eq!(reverse_complement, 0b110000);
+        assert_eq!(min(forward, reverse_complement), reverse_complement);
+
+        for palindrome in [b"AT".as_slice(), b"GC", b"ATAT", b"GCGC"] {
+            assert_eq!(
+                encode_forward(palindrome),
+                encode_reverse_complement(palindrome)
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_kmer_representation_is_consistent_across_code_paths() {
+        for k in [1usize, 3, 5, 8, 11] {
+            for bits in 0..(1u64 << (2 * k)) {
+                let seq = kmer_bytes_from_bits(bits, k);
+                let forward = encode_forward(&seq);
+                let batch_rc = encode_reverse_complement(&seq);
+                let windows = sliding_kmer_windows(&seq, k);
+                assert_eq!(windows.len(), 1, "k={k} seq={seq:?}");
+
+                let (sliding_forward, sliding_rc) = windows[0];
+                assert_eq!(sliding_forward, forward, "k={k} seq={seq:?}");
+                assert_eq!(sliding_rc, batch_rc, "k={k} seq={seq:?}");
+
+                let needletail = canonical((forward, k as u8)).0.0;
+                let min_canonical = min(forward, batch_rc);
+                assert_eq!(
+                    needletail, min_canonical,
+                    "needletail vs batch min mismatch for k={k} seq={seq:?}"
+                );
+                assert_eq!(
+                    needletail,
+                    min(sliding_forward, sliding_rc),
+                    "needletail vs sliding min mismatch for k={k} seq={seq:?}"
+                );
+            }
+        }
+
+        for k in [15usize, 21, 31, 32] {
+            let rolling_seq: Vec<u8> = (0..(k + 64)).map(|i| b"ACGT"[i % 4]).collect();
+            for (forward, sliding_rc) in sliding_kmer_windows(&rolling_seq, k) {
+                let needletail = canonical((forward, k as u8)).0.0;
+                assert_eq!(
+                    needletail,
+                    min(forward, sliding_rc),
+                    "rolling-window mismatch for k={k}, forward={forward:#x}, rc={sliding_rc:#x}"
+                );
+            }
+
+            for seq in [
+                b"TTA".as_slice(),
+                b"ATGCCAGT".as_slice(),
+                b"AAAA".as_slice(),
+                b"ACGTACGT".as_slice(),
+            ] {
+                if seq.len() < k {
+                    continue;
+                }
+                for (forward, sliding_rc) in sliding_kmer_windows(seq, k) {
+                    let needletail = canonical((forward, k as u8)).0.0;
+                    assert_eq!(
+                        needletail,
+                        min(forward, sliding_rc),
+                        "spot-check mismatch for k={k}, seq={seq:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_ref_with_canonical_enabled_stores_needletail_form() {
+        let processor = hash_processor(3, 1, true);
+        let seq = b"ACGNTTA";
+        let mut staged = vec![Vec::new(); 1024];
+        processor.process_ref(seq, &mut staged);
+
+        let mut actual: Vec<u64> = staged.into_iter().flatten().collect();
+        actual.sort_unstable();
+
+        let mut expected: Vec<u64> = sliding_kmer_windows(seq, 3)
+            .into_iter()
+            .map(|(forward, _)| canonical((forward, 3)).0.0)
+            .collect();
+        expected.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "reference indexing must store needletail canonical k-mers for every window"
+        );
+    }
+
+    // Exact sharded store
+
+    #[test]
+    fn hash_shards_stage_insert_query_count_and_clear() {
+        let mut store = HashShards::new(123, 0.25);
+        assert_eq!(store.count(), 0);
+
+        let kmer = 0x1234_5678_9abc_def0;
+        let other = 0xfedc_ba98_7654_3210;
+        assert!(store.map(&kmer) < 1024);
+        assert!(!store.contains(&kmer));
+
+        let mut staged = vec![Vec::new(); 1024];
+        store.stage(kmer, &mut staged);
+        assert_eq!(staged.iter().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(staged[store.map(&kmer)], [kmer]);
+        assert!(!store.contains(&kmer), "staging must not insert early");
+
+        store.insert(&kmer);
+        store.insert(&kmer);
+        store.insert(&other);
+        assert!(store.contains(&kmer));
+        assert!(store.contains(&other));
+        assert_eq!(store.count(), 2, "the exact store deduplicates k-mers");
+
+        store.clear();
+        assert_eq!(store.count(), 0);
+        assert!(!store.contains(&kmer));
+        assert!(!store.contains(&other));
+    }
+
+    #[test]
+    fn hash_shards_serialization_round_trip_preserves_exact_set() {
+        let values = [0, 1, 42, u32::MAX as u64, u64::MAX];
+        let mut original = HashShards::new(0, 0.0);
+        for value in values {
+            original.insert(&value);
+        }
+
+        let serialized = original.serialize();
+        assert_eq!(serialized.len(), 1024);
+        assert_eq!(serialized.iter().map(Vec::len).sum::<usize>(), values.len());
+
+        let mut restored = HashShards::new(0, 0.0);
+        restored.from_serialized(serialized);
+        assert_eq!(restored.count(), values.len());
+        for value in values {
+            assert!(restored.contains(&value));
+        }
+        assert!(!restored.contains(&123_456_789));
+    }
+
+    #[test]
+    fn hash_shards_absorbs_pre_sharded_sets() {
+        let values = [7, 11, 13, 17];
+        let template = HashShards::new(0, 0.0);
+        let mut shards = vec![FxHashSet::default(); 1024];
+        for value in values {
+            shards[template.map(&value)].insert(value);
+        }
+
+        let mut store = HashShards::new(0, 0.0);
+        store.absorb_shards(shards);
+        assert_eq!(store.count(), values.len());
+        for value in values {
+            assert!(store.contains(&value));
+        }
+    }
+
+    // Generic processor behavior, using the exact store so absence is deterministic.
+
+    #[test]
+    fn processor_initialization_sets_fields_and_kmer_mask() {
+        for (k, expected_cap) in [
+            (1, 0b11),
+            (5, (1u64 << 10) - 1),
+            (21, (1u64 << 42) - 1),
+            (31, (1u64 << 62) - 1),
+            (32, u64::MAX),
+        ] {
+            let processor = hash_processor(k, 3, true);
+            assert_eq!(processor.k, k);
+            assert_eq!(processor.k_cap, expected_cap);
+            assert_eq!(processor.threshold, 3);
+            assert!(processor.use_canonical);
+            assert_eq!(processor.num_kmers(), 0);
+        }
+    }
+
+    #[test]
+    fn process_ref_stages_each_rolling_window() {
+        let processor = hash_processor(3, 1, false);
+        let mut staged = vec![Vec::new(); 1024];
+        processor.process_ref(b"ACGTA", &mut staged);
+
+        let mut actual: Vec<u64> = staged.into_iter().flatten().collect();
+        actual.sort_unstable();
+        let mut expected = vec![
+            encode_forward(b"ACG"),
+            encode_forward(b"CGT"),
+            encode_forward(b"GTA"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn process_ref_resets_windows_at_invalid_bases() {
+        let processor = hash_processor(3, 1, false);
+        let mut staged = vec![Vec::new(); 1024];
+        processor.process_ref(b"ACGNTAAC", &mut staged);
+
+        let mut actual: Vec<u64> = staged.into_iter().flatten().collect();
+        actual.sort_unstable();
+        let mut expected = vec![
+            encode_forward(b"ACG"),
+            encode_forward(b"TAA"),
+            encode_forward(b"AAC"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "no k-mer may span the N");
+    }
+
+    #[test]
+    fn reference_loading_deduplicates_repeated_kmers() {
+        let mut processor = hash_processor(3, 1, false);
+        add_hash_references(&mut processor, &[b"ACGTA", b"ACGTA"]);
+        assert_eq!(processor.num_kmers(), 3);
+        assert_eq!(
+            processor
+                .serialize_kmers()
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            3
+        );
+        for seq in [b"ACG".as_slice(), b"CGT", b"GTA"] {
+            assert!(processor.contains_kmer(&encode_forward(seq)));
+        }
+    }
+
+    #[test]
+    fn canonical_references_match_both_strands() {
+        let mut processor = hash_processor(5, 1, true);
+        add_hash_references(&mut processor, &[b"ATGCCAGT"]);
+
+        assert!(processor.process_read(b"ATGCCAGT"));
+        assert!(processor.process_read(b"ACTGGCAT"));
+    }
+
+    #[test]
+    fn noncanonical_references_are_strand_specific() {
+        let mut processor = hash_processor(5, 1, false);
+        add_hash_references(&mut processor, &[b"ATGCC"]);
+
+        assert!(processor.process_read(b"ATGCC"));
+        assert!(!processor.process_read(b"GGCAT"));
+    }
+
+    #[test]
+    fn process_read_enforces_threshold_exactly() {
+        let mut processor = hash_processor(3, 2, false);
+        add_hash_references(&mut processor, &[b"AAACCC"]);
+
+        assert!(
+            !processor.process_read(b"AAA"),
+            "one hit is below threshold two"
+        );
+        assert!(
+            processor.process_read(b"AAAC"),
+            "AAA and AAC are two reference hits"
+        );
+
+        let mut repeated_hit_processor = hash_processor(3, 3, false);
+        add_hash_references(&mut repeated_hit_processor, &[b"AAA"]);
+        assert!(
+            repeated_hit_processor.process_read(b"AAAAA"),
+            "three matching windows, even if equal, meet threshold three"
+        );
+    }
+
+    #[test]
+    fn process_read_handles_short_empty_and_interrupted_reads() {
+        let mut processor = hash_processor(3, 1, false);
+        add_hash_references(&mut processor, &[b"AAA"]);
+
+        assert!(!processor.process_read(b""));
+        assert!(!processor.process_read(b"AA"));
+        assert!(!processor.process_read(b"AANAA"));
+        assert!(processor.process_read(b"AANAAA"));
+    }
+
+    #[test]
+    fn sequences_at_k_and_k_plus_one_have_one_and_two_windows() {
+        let processor = hash_processor(10, 1, false);
+        for (sequence, expected_windows) in [
+            (b"ACGTACGTAC".as_slice(), 1),
+            (b"ACGTACGTACT".as_slice(), 2),
+        ] {
+            let mut staged = vec![Vec::new(); 1024];
+            processor.process_ref(sequence, &mut staged);
+            assert_eq!(staged.iter().map(Vec::len).sum::<usize>(), expected_windows);
+        }
+    }
+
+    #[test]
+    fn processor_supports_full_valid_k_range() {
+        for k in [1, 3, 5, 11, 21, 31, 32] {
+            let sequence: Vec<u8> = (0..k).map(|i| b"ACGT"[i % 4]).collect();
+            let mut processor = hash_processor(k, 1, true);
+            add_hash_references(&mut processor, &[&sequence]);
+            assert_eq!(processor.num_kmers(), 1, "exactly one window for k={k}");
+            assert!(processor.process_read(&sequence));
+        }
+    }
+
+    // Bloom sizing, hashing, and storage
+
+    #[test]
+    fn bloom_parameters_are_bounded_power_of_two_blocks() {
+        for &(size, fpr) in &[(0, 0.1), (1, 0.01), (1_000, 0.01), (1_000_000, 1e-6)] {
+            let (blocks, hashes) = bloom_params(size, fpr);
+            assert!(blocks >= 1);
+            assert!(blocks.is_power_of_two());
+            assert!((1..=8).contains(&hashes));
+        }
+
+        let (small, _) = bloom_params(1_000, 0.01);
+        let (large, _) = bloom_params(1_000_000, 0.01);
+        let (loose, _) = bloom_params(10_000, 0.1);
+        let (strict, _) = bloom_params(10_000, 1e-9);
+        assert!(large >= small);
+        assert!(strict >= loose);
+    }
+
+    #[test]
+    fn per_kmer_fpr_composes_to_requested_read_fpr() {
+        for &(read_fpr, k) in &[(0.1, 21), (0.01, 31), (1e-6, 63)] {
+            let per_kmer = per_kmer_fpr(read_fpr, k);
+            let queries = 150usize.saturating_sub(k).max(1) + 1;
+            let recomposed = 1.0 - (1.0 - per_kmer).powi(queries as i32);
+            assert!((recomposed - read_fpr).abs() < 1e-12);
+            assert!(per_kmer > 0.0 && per_kmer <= read_fpr);
+        }
+    }
+
+    #[test]
+    fn bloom_hash_and_probe_extraction_are_deterministic_and_bounded() {
+        let item = 0x0123_4567_89ab_cdef;
+        assert_eq!(bloom_hash(item), bloom_hash(item));
+        assert_ne!(bloom_hash(item), bloom_hash(item + 1));
+
+        let (h1, h2) = bloom_hash(item);
+        for i in 0..8 {
+            assert!(MiniBloom::extract_probe(h2, h1, i) < 512);
+        }
+        assert_eq!(MiniBloom::extract_probe(0x1ff, 0, 0), 0x1ff);
+        assert_eq!(MiniBloom::extract_probe(0, 0x155, 7), 0x155);
+    }
+
+    #[test]
+    fn bloom_insert_query_count_and_clear_have_no_false_negatives() {
+        let mut bloom = MiniBloom::new(1_000, 1e-9);
+        let values = [0, 1, 42, u64::MAX];
+        assert_eq!(bloom.num_bits, bloom.num_blocks() as u64 * 512);
+        assert!(!bloom.contains(&42), "an empty bloom filter cannot match");
+
+        for value in values {
+            bloom.insert(&value);
+        }
+        for value in values {
+            assert!(
+                bloom.contains(&value),
+                "inserted values must never be absent"
+            );
+        }
+        assert_eq!(bloom.count(), values.len());
+
+        bloom.insert(&42);
+        assert_eq!(
+            bloom.count(),
+            values.len() + 1,
+            "Bloom count tracks insertions rather than estimated cardinality"
+        );
+        bloom.clear();
+        assert_eq!(bloom.count(), 0);
+        assert!(bloom_words(&bloom).iter().all(|&word| word == 0));
+    }
+
+    #[test]
+    fn prehashed_paths_match_regular_insert_and_query_for_all_hash_counts() {
+        let item = 0xdead_beef_cafe_babe;
+        for hashes in 1..=8 {
+            let mut regular = MiniBloom::new(1_000, 0.01);
+            let prehashed = MiniBloom::new(1_000, 0.01);
+            regular.num_hashes = hashes;
+            let mut prehashed = prehashed;
+            prehashed.num_hashes = hashes;
+
+            regular.insert(&item);
+            let (block_start, h2, h1_upper) = prehashed.hash_and_prefetch(item);
+            assert!(!prehashed.contains_prehashed(block_start, h2, h1_upper));
+            prehashed.insert_prehashed(block_start, h2, h1_upper);
+
+            assert!(prehashed.contains_prehashed(block_start, h2, h1_upper));
+            assert_eq!(bloom_words(&prehashed), bloom_words(&regular));
+        }
+    }
+
+    #[test]
+    fn bloom_bulk_loading_paths_preserve_every_input() {
+        let values = [3, 5, 8, 13, 21];
+        let template = MiniBloom::new(1_000, 1e-9);
+
+        let mut serialized = vec![Vec::new(); 1024];
+        for value in values {
+            template.stage(value, &mut serialized);
+        }
+        let mut from_serialized = MiniBloom::new(1_000, 1e-9);
+        from_serialized.from_serialized(serialized);
+        assert_eq!(from_serialized.count(), values.len());
+        for value in values {
+            assert!(from_serialized.contains(&value));
+        }
+
+        let mut shards = vec![FxHashSet::default(); 1024];
+        for value in values {
+            shards[template.map(&value)].insert(value);
+        }
+        let mut absorbed = MiniBloom::new(1_000, 1e-9);
+        absorbed.absorb_shards(shards);
+        assert_eq!(absorbed.count(), values.len());
+        for value in values {
+            assert!(absorbed.contains(&value));
+        }
+    }
+
+    #[test]
+    fn bloom_fill_stats_measure_actual_bits_per_block() {
+        let bloom = MiniBloom::new(1_000, 0.01);
+        bloom.data[0].store(0b1011, AtomicOrdering::Relaxed);
+        bloom.data[8].store(0b1, AtomicOrdering::Relaxed);
+
+        let (average, minimum, maximum) = bloom.fill_stats();
+        let expected_average = 4.0 / bloom.num_bits as f64;
+        assert!((average - expected_average).abs() < f64::EPSILON);
+        assert_eq!(minimum, 0.0);
+        assert_eq!(maximum, 3.0 / 512.0);
+    }
+
+    #[test]
+    fn bloom_save_load_round_trip_preserves_bits_and_metadata() {
+        let mut bloom = MiniBloom::new(1_000, 1e-9);
+        let values = [2, 3, 5, 7, 11];
+        for value in values {
+            bloom.insert(&value);
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+
+        bloom.save(path, 31, values.len() as u64).unwrap();
+        let (loaded, k, count) = MiniBloom::load(path).unwrap();
+        assert_eq!(k, 31);
+        assert_eq!(count, values.len() as u64);
+        assert_eq!(loaded.count(), values.len());
+        assert_eq!(loaded.num_hashes, bloom.num_hashes);
+        assert_eq!(loaded.num_bits, bloom.num_bits);
+        assert_eq!(bloom_words(&loaded), bloom_words(&bloom));
+        for value in values {
+            assert!(loaded.contains(&value));
+        }
+    }
+
+    #[test]
+    fn bloom_load_rejects_bad_magic_and_truncated_files() {
+        let mut bad_magic = tempfile::NamedTempFile::new().unwrap();
+        bad_magic.write_all(b"NOPE").unwrap();
+        let error = match MiniBloom::load(bad_magic.path().to_str().unwrap()) {
+            Ok(_) => panic!("bad magic was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut truncated = tempfile::NamedTempFile::new().unwrap();
+        truncated.write_all(b"NBLM").unwrap();
+        let error = match MiniBloom::load(truncated.path().to_str().unwrap()) {
+            Ok(_) => panic!("truncated bloom file was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    // Bloom-specialized processor paths
+
+    #[test]
+    fn optimized_bloom_insertion_counts_windows_and_resets_at_invalid_bases() {
+        let processor = bloom_processor(3, 1, false);
+        let count = processor.insert_kmers_bloom(b"ACGTNAAAANCC");
+        assert_eq!(count, 4, "two ACGT windows plus two AAAA windows");
+
+        for seq in [b"ACG".as_slice(), b"CGT", b"AAA"] {
+            assert!(processor.contains_kmer(&encode_forward(seq)));
+        }
+
+        let mut expected = MiniBloom::new(10_000, 1e-9);
+        for seq in [b"ACG".as_slice(), b"CGT", b"AAA"] {
+            expected.insert(&encode_forward(seq));
+        }
+        assert_eq!(
+            bloom_words(&processor.ref_kmers),
+            bloom_words(&expected),
+            "the optimized path must not set bits for windows spanning N"
+        );
+    }
+
+    #[test]
+    fn optimized_bloom_insertion_handles_more_than_prefetch_depth() {
+        let processor = bloom_processor(5, 1, true);
+        let sequence = b"ACGTTGCAACGTAGCTTACGGTACCGATTCGAACGT";
+        let expected_windows = sequence.len() - processor.k + 1;
+        assert_eq!(
+            processor.insert_kmers_bloom(sequence),
+            expected_windows as u64
+        );
+        assert!(processor.process_read_bloom(sequence));
+    }
+
+    #[test]
+    fn optimized_bloom_query_enforces_threshold_and_boundaries() {
+        let processor = bloom_processor(3, 2, false);
+        processor.insert_kmers_bloom(b"AAAC");
+
+        assert!(!processor.process_read_bloom(b""));
+        assert!(!processor.process_read_bloom(b"AA"));
+        assert!(!processor.process_read_bloom(b"AAA"));
+        assert!(processor.process_read_bloom(b"AAAC"));
+    }
+
+    #[test]
+    fn optimized_and_generic_bloom_queries_agree_on_known_hits_and_empty_filter() {
+        let populated = bloom_processor(5, 1, true);
+        populated.insert_kmers_bloom(b"ATGCCAGT");
+        for read in [b"ATGCCAGT".as_slice(), b"ACTGGCAT"] {
+            assert!(populated.process_read(read));
+            assert!(populated.process_read_bloom(read));
+        }
+
+        let empty = bloom_processor(5, 1, true);
+        for read in [b"ATGCCAGT".as_slice(), b"TTTTTTTT"] {
+            assert!(!empty.process_read(read));
+            assert!(!empty.process_read_bloom(read));
+        }
+    }
+
+    #[test]
+    fn optimized_bloom_query_drains_prefetched_windows_before_and_after_invalid_base() {
+        let processor = bloom_processor(3, 2, false);
+        processor.insert_kmers_bloom(b"AAAC");
+
+        assert!(
+            processor.process_read_bloom(b"AAACN"),
+            "AAA and AAC before N must both be queried"
+        );
+        assert!(
+            processor.process_read_bloom(b"NAAAC"),
+            "AAA and AAC after N must both be queried"
+        );
+    }
 }

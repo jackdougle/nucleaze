@@ -1,6 +1,5 @@
 //! Argument parsing & validation
 mod core;
-mod kmer_ops;
 
 use std::env;
 use std::io;

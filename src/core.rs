@@ -1,5 +1,5 @@
 //! I/O for reference indexing and read processing operations using k-mers
-use crate::kmer_ops::{HashShards, KmerProcessor, KmerStore, MiniBloom, per_kmer_fpr};
+use nucleaze::kmer_ops::{HashShards, KmerProcessor, KmerStore, MiniBloom, encode, per_kmer_fpr};
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -39,60 +39,59 @@ impl Display for InputSource {
     }
 }
 
-/// A fixed pool of permits, used as a counting semaphore to bound how many chunk
-/// arenas are alive at once (from creation through write). Pre-filled with
-/// `capacity` tokens; `acquire` blocks until one is free.
-struct PermitPool {
-    tx: Sender<()>,
-    rx: crossbeam::channel::Receiver<()>,
+/// Limits how many read arenas may exist before their results are written.
+/// `acquire` waits when no arena slot is available.
+struct ArenaSlotPool {
+    slot_sender: Sender<()>,
+    slot_receiver: crossbeam::channel::Receiver<()>,
 }
 
-impl PermitPool {
+impl ArenaSlotPool {
     fn new(capacity: usize) -> Self {
-        let (tx, rx) = bounded::<()>(capacity);
+        let (slot_sender, slot_receiver) = bounded::<()>(capacity);
         for _ in 0..capacity {
-            tx.send(()).expect("prefill permit pool"); // capacity == tokens, never blocks
+            slot_sender.send(()).expect("initialize arena slot pool"); // every slot starts free
         }
-        PermitPool { tx, rx }
+        ArenaSlotPool {
+            slot_sender,
+            slot_receiver,
+        }
     }
 
-    fn acquire(&self) -> ChunkPermit {
-        self.rx.recv().expect("chunk permit pool disconnected");
-        ChunkPermit {
-            pool: self.tx.clone(),
+    fn acquire(&self) -> ArenaSlotGuard {
+        self.slot_receiver
+            .recv()
+            .expect("arena slot pool disconnected");
+        ArenaSlotGuard {
+            slot_sender: self.slot_sender.clone(),
         }
     }
 }
 
-/// A permit for one in-flight chunk. Acquired from the `PermitPool` before the
-/// chunk's arena is filled and carried inside the `SequenceChunk`, so it is dropped
-/// only after the chunk is written (and, in `--order` mode, after it leaves the
-/// reorder heap). Dropping it returns the token to the pool — the backpressure that
-/// bounds how many chunks are in flight.
-struct ChunkPermit {
-    pool: Sender<()>,
+/// Stored in each chunk to keep one arena slot unavailable.
+/// Its `Drop` implementation returns the slot when the chunk is dropped.
+struct ArenaSlotGuard {
+    slot_sender: Sender<()>,
 }
 
-impl Drop for ChunkPermit {
+impl Drop for ArenaSlotGuard {
     fn drop(&mut self) {
-        // Returning the token can't block: this guard holds one of the pool's slots,
-        // so there is always room. The result is ignored because at shutdown the
-        // reader thread drops the pool's `Receiver`, and the final chunks then return
-        // tokens that nothing will reuse.
-        let _ = self.pool.send(());
+        // `acquire` removed one entry, so the bounded channel has room to return it.
+        // Ignore errors after the slot receiver is dropped during shutdown.
+        let _ = self.slot_sender.send(());
     }
 }
 
-/// A chunk of sequences with their match results
+/// A read arena, its offsets, and its k-mer match results.
 struct SequenceChunk {
     id: u32,
-    data_arena: Vec<u8>,                          // raw bytes for all sequences
+    data_arena: Vec<u8>, // contiguous bytes for every read in this chunk
     offsets: Vec<(u32, u32, u32, u32, u32, u32)>, // (id_start, id_len, seq_start, seq_len, qual_start, qual_len)
     matches: Vec<bool>,                           // k-mer match results
-    _permit: ChunkPermit, // returned to the permit pool on drop (after write)
+    _arena_slot: ArenaSlotGuard,                  // returns the slot when dropped
 }
 
-// Equality is by `id` only (matching the id-only `Ord`); the permit guard is not comparable.
+// Compare only IDs; the arena slot does not affect output order.
 impl PartialEq for SequenceChunk {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -101,7 +100,7 @@ impl PartialEq for SequenceChunk {
 
 impl Eq for SequenceChunk {}
 
-// Implement Ord for BinaryHeap to support ordered output
+// Reverse ID comparison so `BinaryHeap::pop` returns the lowest ID first.
 impl Ord for SequenceChunk {
     fn cmp(&self, other: &Self) -> Ordering {
         other.id.cmp(&self.id) // min-heap for sequential processing
@@ -116,6 +115,7 @@ impl PartialOrd for SequenceChunk {
 
 /// Processing reads against a reference k-mer index
 pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
+    let memory_limited = args.maxmem.is_some();
     let available_threads = num_cpus::get();
     let num_threads = args
         .threads
@@ -138,7 +138,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     let bin_kmers_path = args.binref.unwrap_or_default();
     let save_kmers_path = args.saveref.unwrap_or_default();
 
-    // Extract remaining args fields before dispatch (avoids partial move)
+    // Copy settings needed after input and output paths are moved.
     let ordered_output = args.order;
     let interleaved_input = args.interinput;
     let input = match args.r#in.as_deref() {
@@ -162,7 +162,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
     };
 
     if fpr > 0.0 {
-        // Bloom mode — try loading pre-built bloom index, otherwise build from scratch
+        // Load a saved Bloom index, or build a new one if loading fails.
         let kmer_fpr = per_kmer_fpr(fpr as f64, k);
 
         if !bin_kmers_path.is_empty() {
@@ -258,10 +258,10 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
             num_threads,
         )
     } else {
-        // Hash mode — full serialization support
+        // Exact hash mode supports loading and saving an index.
         let mut store = HashShards::new(0, 0.0);
 
-        // Attempt to load pre-built index directly onto the store before going generic
+        // Try loading a saved hash index before building a new one.
         let loaded = try_deserialize_hash(&bin_kmers_path, &mut store, k);
         let mut processor = KmerProcessor::new(k, min_hits, use_canonical, store);
 
@@ -275,7 +275,7 @@ pub fn run(args: crate::Args, start_time: Instant) -> IOResult<()> {
             if !bin_kmers_path.is_empty() {
                 eprintln!("Invalid serialized reference file, building from scratch.");
             }
-            match get_reference_kmers(&ref_path, &mut processor, num_threads) {
+            match get_reference_kmers(&ref_path, &mut processor, num_threads, !memory_limited) {
                 Ok(()) => println!(
                     "Added {} k-mer(s) from {}",
                     processor.num_kmers() - 1,
@@ -426,7 +426,7 @@ fn try_deserialize_hash(path: &str, store: &mut HashShards, k: usize) -> bool {
 
     store.from_serialized(data);
 
-    // Verify metadata sentinel
+    // Check that the saved index contains the metadata k-mer for this k value.
     let sentinel = u64::MAX ^ k as u64;
     let sentinel_present = store.contains(&sentinel);
     if !sentinel_present {
@@ -440,6 +440,7 @@ fn get_reference_kmers<S: KmerStore>(
     ref_path: &str,
     processor: &mut KmerProcessor<S>,
     num_threads: usize,
+    coarse_batches: bool,
 ) -> Result<(), Box<dyn Error>> {
     let ref_meta = metadata(&ref_path)?;
     if ref_meta.is_file() && ref_meta.len() == 0 {
@@ -455,7 +456,15 @@ fn get_reference_kmers<S: KmerStore>(
 
     let (sender, receiver) = bounded::<Vec<u8>>(16);
 
-    spawn_reader(ref_path, sender).expect("k-mer extraction failed");
+    spawn_reference_reader(
+        ref_path,
+        sender,
+        processor.k,
+        num_threads,
+        true,
+        coarse_batches,
+    )
+    .expect("k-mer extraction failed");
 
     (0..num_threads).into_par_iter().for_each(|_| {
         let mut local_idx = vec![Vec::with_capacity(64); SUBINDEX_COUNT];
@@ -466,9 +475,51 @@ fn get_reference_kmers<S: KmerStore>(
             for (i, local_subidx) in local_idx.iter_mut().enumerate() {
                 if !local_subidx.is_empty() {
                     let mut merged_subidx = merged_idx[i].lock().unwrap();
+                    const LARGE_BATCH: usize = 4096;
 
-                    for &kmer in local_subidx.iter() {
-                        merged_subidx.insert(kmer);
+                    if local_subidx.len() <= LARGE_BATCH {
+                        // Reserve small batches while holding the shard lock to avoid
+                        // repeated hash-table growth.
+                        merged_subidx.reserve(local_subidx.len());
+                        for &kmer in local_subidx.iter() {
+                            merged_subidx.insert(kmer);
+                        }
+                    } else {
+                        // Sample large batches to estimate unique k-mers before
+                        // reserving space, reducing excess allocation for repeats.
+                        const SAMPLE_SIZE: usize = 64;
+                        let sample_len = local_subidx.len().min(SAMPLE_SIZE);
+                        let first_kmer = local_subidx[0];
+
+                        if local_subidx[..sample_len]
+                            .iter()
+                            .all(|&kmer| kmer == first_kmer)
+                        {
+                            for &kmer in local_subidx.iter() {
+                                merged_subidx.insert(kmer);
+                            }
+                            local_subidx.clear();
+                            continue;
+                        }
+
+                        let len_before_sample = merged_subidx.len();
+
+                        for &kmer in &local_subidx[..sample_len] {
+                            merged_subidx.insert(kmer);
+                        }
+
+                        let sample_uniques = merged_subidx.len() - len_before_sample;
+                        let remaining = local_subidx.len() - sample_len;
+                        if sample_uniques * 2 >= sample_len {
+                            let estimated_uniques = remaining
+                                .saturating_mul(sample_uniques)
+                                .div_ceil(sample_len);
+                            merged_subidx.reserve(estimated_uniques);
+                        }
+
+                        for &kmer in &local_subidx[sample_len..] {
+                            merged_subidx.insert(kmer);
+                        }
                     }
 
                     local_subidx.clear();
@@ -477,14 +528,12 @@ fn get_reference_kmers<S: KmerStore>(
         }
     });
 
-    if processor.needs_absorb() {
-        let shards = Arc::try_unwrap(merged_idx)
-            .expect("merged_idx still has multiple owners")
-            .into_iter()
-            .map(|m| m.into_inner().unwrap())
-            .collect();
-        processor.ref_kmers.absorb_shards(shards);
-    }
+    let shards = Arc::try_unwrap(merged_idx)
+        .expect("merged_idx still has multiple owners")
+        .into_iter()
+        .map(|m| m.into_inner().unwrap())
+        .collect();
+    processor.ref_kmers.absorb_shards(shards);
 
     if processor.num_kmers() == 0 {
         return Err(format!("reference file(s) contained no usable k-mers").into());
@@ -495,8 +544,7 @@ fn get_reference_kmers<S: KmerStore>(
     Ok(())
 }
 
-/// Build k-mer index from reference using direct atomic bloom insertion with prefetch.
-/// Bypasses the stage/absorb pipeline for better performance.
+/// Build a Bloom index with parallel atomic inserts into the shared filter.
 fn get_reference_kmers_bloom(
     ref_path: &str,
     processor: &KmerProcessor<MiniBloom>,
@@ -509,9 +557,9 @@ fn get_reference_kmers_bloom(
 
     let kmer_counter = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = bounded::<Vec<u8>>(16);
-    spawn_reader(ref_path, sender)?;
+    spawn_reference_reader(ref_path, sender, processor.k, num_threads, false, false)?;
 
-    // Parallel k-mer extraction + atomic bloom insertion with software-pipelined prefetch
+    // Rayon workers update shared atomic Bloom blocks without a merge step.
     let counter_ref = kmer_counter.clone();
     (0..num_threads).into_par_iter().for_each(|_| {
         let mut count = 0u64;
@@ -526,30 +574,168 @@ fn get_reference_kmers_bloom(
         return Err("reference file(s) contained no usable k-mers".into());
     }
 
-    // The k size is stored explicitly in the bloom file header (see MiniBloom::save),
-    // so no in-band sentinel is needed here.
+    // The Bloom file header includes k, so no metadata k-mer is needed.
 
     Ok(total_kmers)
 }
 
-// Delegate single thread to parse ref file and send read sequences
-fn spawn_reader(path: &str, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error>> {
+// A dedicated parser thread divides long records into chunks for worker threads.
+// Chunks overlap by k-1 bases so k-mers spanning a boundary are included.
+fn spawn_reference_reader(
+    path: &str,
+    sender: Sender<Vec<u8>>,
+    k: usize,
+    num_threads: usize,
+    exact_mode: bool,
+    coarse_exact_batches: bool,
+) -> Result<(), Box<dyn Error>> {
     let path = path.to_string();
 
     thread::spawn(move || {
         let mut reader = parse_fastx_file(&path).expect("FASTA open failed");
+        let overlap = k.saturating_sub(1);
 
         while let Some(record) = reader.next() {
             let record = match record {
                 Ok(r) => r,
                 Err(_) => return,
             };
+            let seq = record.seq();
+            let mut start = 0;
+            let low_complexity = exact_mode && reference_sample_is_low_complexity(&seq, k);
 
-            sender.send(record.seq().to_vec()).unwrap();
+            if low_complexity {
+                if let Some(period) = reference_repeat_period(&seq) {
+                    // For period p, the first p + k - 1 bases contain every distinct
+                    // k-mer. Additional periods produce only duplicates.
+                    let compact_len = (period + k.saturating_sub(1)).min(seq.len());
+                    if sender.send(seq[..compact_len].to_vec()).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            let chunk_bases = if num_threads == 1 {
+                seq.len().max(1)
+            } else if coarse_exact_batches && !low_complexity {
+                // Records up to 8 MiB use one chunk. Longer records use about one
+                // chunk per worker, or 16 MiB chunks when that split exceeds 8 MiB.
+                if seq.len() <= 8 << 20 {
+                    seq.len().max(1)
+                } else {
+                    let per_worker = seq.len().div_ceil(num_threads);
+                    if per_worker > 8 << 20 {
+                        16 << 20
+                    } else {
+                        per_worker
+                    }
+                }
+            } else {
+                // Atomic Bloom inserts need no hash-set merge. Smaller chunks give
+                // Rayon more tasks to distribute among worker threads.
+                (seq.len() / num_threads.saturating_mul(2).max(1)).clamp(1 << 18, 1 << 20)
+            };
+
+            loop {
+                let end = (start + chunk_bases).min(seq.len());
+                if sender.send(seq[start..end].to_vec()).is_err() || end == seq.len() {
+                    break;
+                }
+                start = end - overlap;
+            }
         }
     });
 
     Ok(())
+}
+
+/// Sample k-mers across a record to detect low-complexity repeats.
+/// The result selects a chunk size without a second full scan.
+fn reference_sample_is_low_complexity(seq: &[u8], k: usize) -> bool {
+    const MAX_SAMPLES: usize = 1024;
+    const MIN_VALID_SAMPLES: usize = 64;
+
+    if k == 0 || seq.len() < k {
+        return false;
+    }
+
+    let prefix_len = seq.len().min(4096);
+    if seq[..prefix_len].iter().all(|&base| base == seq[0]) {
+        return true;
+    }
+
+    let windows = seq.len() - k + 1;
+    let sample_count = windows.min(MAX_SAMPLES);
+    let mut valid_samples = 0usize;
+    let mut distinct = FxHashSet::default();
+
+    for sample in 0..sample_count {
+        let start = if sample_count == 1 {
+            0
+        } else {
+            sample * (windows - 1) / (sample_count - 1)
+        };
+        let mut kmer = 0u64;
+        let mut valid = true;
+
+        for &base in &seq[start..start + k] {
+            let Some(bits) = encode(base) else {
+                valid = false;
+                break;
+            };
+            kmer = (kmer << 2) | bits;
+        }
+
+        if valid {
+            valid_samples += 1;
+            distinct.insert(kmer);
+        }
+    }
+
+    valid_samples >= MIN_VALID_SAMPLES && distinct.len() * 4 < valid_samples
+}
+
+/// Find an exact repeat period of at most 64 bases, test 409 bases first.
+fn reference_repeat_period(seq: &[u8]) -> Option<usize> {
+    const MAX_PERIOD: usize = 64;
+    const PREFIX_BASES: usize = 4096;
+
+    if seq.len() < 2 {
+        return None;
+    }
+
+    let prefix_len = seq.len().min(PREFIX_BASES);
+    let max_period = MAX_PERIOD.min(prefix_len / 2);
+
+    'periods: for period in 1..=max_period {
+        for i in 0..prefix_len {
+            let Some(base) = encode(seq[i]) else {
+                continue 'periods;
+            };
+            let Some(expected) = encode(seq[i % period]) else {
+                continue 'periods;
+            };
+            if base != expected {
+                continue 'periods;
+            }
+        }
+
+        for i in prefix_len..seq.len() {
+            let Some(base) = encode(seq[i]) else {
+                continue 'periods;
+            };
+            let Some(expected) = encode(seq[i % period]) else {
+                continue 'periods;
+            };
+            if base != expected {
+                continue 'periods;
+            }
+        }
+
+        return Some(period);
+    }
+
+    None
 }
 
 /// Save hash index to binary file.
@@ -641,25 +827,23 @@ fn process_reads(
         }
     }
 
-    // Channel for passing chunks from reader thread to writer
+    // Use a bounded sync channel to send processed chunks to the writing thread.
     let (chunk_sender, chunk_receiver): (SyncSender<SequenceChunk>, Receiver<SequenceChunk>) =
         sync_channel(20);
 
-    // Bound how many chunk arenas are alive at once (creation through write) so peak
-    // memory stays flat in input size instead of growing when the reader outruns the
-    // writer. Sized as one arena per worker plus headroom for the output channel and
-    // the reorder heap.
-    let permit_pool = PermitPool::new(rayon::current_num_threads() + 24);
+    // Limit arenas retained by workers, the output queue, and ordered output.
+    // Capacity is one arena per Rayon worker plus 24 additional arenas.
+    let arena_slot_pool = ArenaSlotPool::new(rayon::current_num_threads() + 24);
 
     let chunk_pos = Arc::new(AtomicU32::new(0));
 
-    // Extract file extensions
+    // Get each output format from its file name.
     let matched_filetype = matched_path.rsplit('.').next().unwrap_or("").to_string();
     let unmatched_filetype = unmatched_path.rsplit('.').next().unwrap_or("").to_string();
     let matched2_filetype = matched2_path.rsplit('.').next().unwrap_or("").to_string();
     let unmatched2_filetype = unmatched2_path.rsplit('.').next().unwrap_or("").to_string();
 
-    // Check if output is to stdout
+    // Check which output paths mean standard output.
     let matched_stdout = matched_path == "stdout" || matched_path.starts_with("stdout.");
     let unmatched_stdout = unmatched_path == "stdout" || unmatched_path.starts_with("stdout.");
     let matched2_stdout = matched2_path == "stdout" || matched2_path.starts_with("stdout.");
@@ -668,7 +852,7 @@ fn process_reads(
     let parallel_sender = chunk_sender.clone();
     let parellel_chunk_pos = chunk_pos.clone();
 
-    // Worker thread: reads sequences and dispatches chunks to Rayon for parallel k-mer processing
+    // Parser thread fills arenas and sends them for k-mer matching.
     let worker_thread = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut reader = match input {
             InputSource::Stdin => parse_fastx_reader(stdin()),
@@ -678,25 +862,22 @@ fn process_reads(
         const CHUNK_SIZE: usize = 10_000;
         const ARENA_CAPACITY: usize = CHUNK_SIZE * 500;
 
-        // Current chunk being built
+        // Build each chunk in one byte arena and store offsets into that arena.
         let mut arena: Vec<u8> = Vec::with_capacity(ARENA_CAPACITY);
         let mut offsets: Vec<(u32, u32, u32, u32, u32, u32)> = Vec::with_capacity(CHUNK_SIZE);
 
-        // Dispatch a filled arena to Rayon for k-mer processing. The permit for the
-        // arena is moved in and rides on the resulting chunk until it is written.
+        // Submit a full arena for processing. Store its slot guard in the result until the
+        // chunk is written and dropped, including time in the ordered-output buffer.
         let process_arena = |local_arena: Vec<u8>,
                              local_offsets: Vec<(u32, u32, u32, u32, u32, u32)>,
-                             permit: ChunkPermit| {
+                             arena_slot: ArenaSlotGuard| {
             let read_fn = read_fn.clone();
             let sender = parallel_sender.clone();
             let current_chunk_pos = parellel_chunk_pos.fetch_add(1, AtomicOrdering::SeqCst);
 
             rayon::spawn(move || {
-                // k-mer matching: map over offsets to slice into the arena (avoids
-                // copying sequence data). Matching is sequential within a chunk;
-                // parallelism comes from many chunks dispatched across the pool.
-                // Keeping it sequential avoids nested Rayon join/collect, whose
-                // work-stealing-while-blocked can amplify worker stack depth.
+                // Each Rayon task matches one arena sequentially, while Rayon runs
+                // multiple arena tasks in parallel. This avoids nested parallelism.
                 let matches: Vec<bool> = local_offsets
                     .iter()
                     .map(|(_, _, seq_start, seq_len, _, _)| {
@@ -711,15 +892,15 @@ fn process_reads(
                     data_arena: local_arena,
                     offsets: local_offsets,
                     matches,
-                    _permit: permit,
+                    _arena_slot: arena_slot,
                 };
 
-                // Blocks if channel is full (backpressure)
+                // `SyncSender::send` blocks when the 20-chunk output queue is full.
                 let _ = sender.send(chunk);
             });
         };
 
-        // Add one record to the arena
+        // Append a read's ID, sequence, and quality to the arena and record offsets.
         let push_record =
             |id: &[u8],
              seq: &[u8],
@@ -741,12 +922,11 @@ fn process_reads(
                 offsets.push((id_start, id_len, seq_start, seq_len, qual_start, qual_len));
             };
 
-        // Acquire a permit for the arena we are about to fill, so the in-progress
-        // arena counts against the in-flight budget like the dispatched chunks do.
-        // Blocks when the pool is exhausted, throttling chunk creation.
-        let mut permit = permit_pool.acquire();
+        // Call `acquire` before filling an arena. It waits while the maximum number
+        // of arenas are being processed, queued, or written.
+        let mut arena_slot = arena_slot_pool.acquire();
 
-        // Read and chunk sequences based on mode
+        // Read sequences in the selected single or paired mode.
         if process_mode == ProcessMode::Unpaired
             || process_mode == ProcessMode::Interleaved
             || process_mode == ProcessMode::InterInPairedOut
@@ -765,15 +945,16 @@ fn process_reads(
                 );
 
                 if offsets.len() == CHUNK_SIZE {
-                    // Double buffering: swap buffers and dispatch filled one
+                    // Move the full arena to Rayon and replace it with an empty arena
+                    // so the parser can continue reading.
                     let local_arena = mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
                     let local_offsets = mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
-                    process_arena(local_arena, local_offsets, permit);
-                    permit = permit_pool.acquire(); // for the now-empty next arena
+                    process_arena(local_arena, local_offsets, arena_slot);
+                    arena_slot = arena_slot_pool.acquire(); // reserve the next arena slot
                 }
             }
         } else {
-            // Paired modes: read from two files simultaneously
+            // Read both files together in paired modes.
             let mut reader2 = parse_fastx_file(&reads2_path)?;
 
             loop {
@@ -805,8 +986,8 @@ fn process_reads(
                                 mem::replace(&mut arena, Vec::with_capacity(ARENA_CAPACITY));
                             let local_offsets =
                                 mem::replace(&mut offsets, Vec::with_capacity(CHUNK_SIZE));
-                            process_arena(local_arena, local_offsets, permit);
-                            permit = permit_pool.acquire(); // for the now-empty next arena
+                            process_arena(local_arena, local_offsets, arena_slot);
+                            arena_slot = arena_slot_pool.acquire(); // reserve the next arena slot
                         }
                     }
                     (Some(_), None) => {
@@ -828,24 +1009,23 @@ fn process_reads(
             }
         }
 
-        // Process remaining sequences, handing the last permit to the last chunk.
-        // If there are none, `permit` drops here and returns its token (the correct
-        // behavior for empty / zero-read input).
+        // Send the final partially filled arena. If it is empty, dropping
+        // `arena_slot` returns the unused slot to the pool.
         if !offsets.is_empty() {
-            process_arena(arena, offsets, permit);
+            process_arena(arena, offsets, arena_slot);
         }
 
         Ok(())
     });
 
-    // Close channel from sender side so receiver knows when to stop
+    // Drop the original sender; the receiver closes after all Rayon clones finish.
     drop(chunk_sender);
 
     let mut matched_writer: BufWriter<File> = BufWriter::new(File::create(matched_path)?);
     let mut unmatched_writer: BufWriter<File> =
         BufWriter::with_capacity(4_000_000, File::create(unmatched_path)?);
 
-    // Optional writers for paired output splitting
+    // Open second output files when writing paired reads separately.
     let mut m2_writer =
         if process_mode == ProcessMode::InterInPairedOut || process_mode == ProcessMode::Paired {
             Some(BufWriter::new(File::create(matched2_path)?))
@@ -864,13 +1044,14 @@ fn process_reads(
     let useq_count = Arc::new(AtomicU64::new(0));
     let ubase_count = Arc::new(AtomicU64::new(0));
 
-    // Write a SequenceChunk to disk, reconstructing reads from the arena
+    // Create ID, sequence, and quality slices from the contiguous arena without
+    // copying their bytes.
     let mut chunk_output = |chunk: &SequenceChunk| -> Result<(), Box<dyn Send + Sync + Error>> {
         let arena = &chunk.data_arena;
         let offsets = &chunk.offsets;
         let matches = &chunk.matches;
 
-        // Slice arena to reconstruct individual read
+        // Use stored offsets to borrow this read's ID, sequence, and quality slices.
         let get_read = |pos: usize| {
             let (id_s, id_l, seq_s, seq_l, qual_s, qual_l) = offsets[pos];
             (
@@ -908,11 +1089,11 @@ fn process_reads(
                 }
             }
         } else {
-            // Paired-end: process reads in pairs (stride 2)
-            // If either read matches, both are written to matched output
+            // Handle two reads at a time. If either matches, write both to the
+            // matched output.
             let num_reads = offsets.len();
             let reads_to_process = if num_reads % 2 != 0 {
-                // Odd number of reads in paired/interleaved mode - skip the last unpaired read
+                // Skip a final read that has no partner.
                 eprintln!(
                     "Warning: Odd number of reads ({}) in interleaved pairs mode. \
                      The last unpaired read will be skipped.",
@@ -1004,18 +1185,19 @@ fn process_reads(
     };
 
     if ordered_output {
-        // Ordered mode: use min-heap to reorder chunks as they arrive
+        // Store out-of-order chunks in a `BinaryHeap`. Reversed `Ord` makes `pop`
+        // return the chunk with the lowest ID.
         let mut out_of_order_buffer: BinaryHeap<SequenceChunk> = BinaryHeap::new();
         let mut next_chunk_id = 0;
         const MAX_BUFFERED_CHUNKS: usize = 1000;
 
         for chunk in chunk_receiver {
             if chunk.id == next_chunk_id {
-                // Chunk arrived in order
+                // This is the next chunk to write.
                 chunk_output(&chunk)?;
                 next_chunk_id += 1;
 
-                // Check if subsequent chunks are already buffered
+                // Write any following chunks that are already waiting.
                 while let Some(buffered) = out_of_order_buffer.peek() {
                     if buffered.id == next_chunk_id {
                         let buffered = out_of_order_buffer.pop().unwrap();
@@ -1026,14 +1208,14 @@ fn process_reads(
                     }
                 }
             } else {
-                // Chunk arrived early, buffer it
+                // Save this chunk until earlier chunks arrive.
                 out_of_order_buffer.push(chunk);
                 if out_of_order_buffer.len() > MAX_BUFFERED_CHUNKS {
                     return Err(Box::from("Too many out-of-order chunks buffered."));
                 }
             }
         }
-        // Drain remaining buffered chunks
+        // Write any chunks that are still waiting.
         while let Some(buffered) = out_of_order_buffer.pop() {
             if buffered.id == next_chunk_id {
                 chunk_output(&buffered)?;
@@ -1043,7 +1225,7 @@ fn process_reads(
             }
         }
     } else {
-        // Unordered mode: write chunks as they arrive
+        // Write each chunk as soon as it is ready.
         for chunk in chunk_receiver {
             chunk_output(&chunk)?;
         }

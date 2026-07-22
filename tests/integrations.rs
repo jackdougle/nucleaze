@@ -118,6 +118,120 @@ fn test_filtering_ambiguous_sequences() {
 }
 
 #[test]
+fn test_reference_kmer_crossing_parallel_chunk_boundary() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("ref.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+
+    // Exact and Bloom indexing deliberately use different chunk sizes. Place a
+    // unique mixed k-mer across a boundary for each mode so both overlap paths
+    // are covered.
+    let reference_len: usize = 9 << 20;
+    let exact_boundary = reference_len.div_ceil(4);
+    let bloom_boundary = 1 << 20;
+    let mut reference = vec![b'A'; reference_len];
+    reference[exact_boundary - 10..exact_boundary].fill(b'C');
+    reference[exact_boundary..exact_boundary + 11].fill(b'G');
+    reference[bloom_boundary - 10..bloom_boundary].fill(b'G');
+    reference[bloom_boundary..bloom_boundary + 11].fill(b'T');
+    let reference = String::from_utf8(reference).unwrap();
+    create_fasta(&ref_path, &[("ref", &reference)]).unwrap();
+    create_fastq(
+        &reads_path,
+        &[
+            (
+                "exact_boundary",
+                "CCCCCCCCCCGGGGGGGGGGG",
+                "IIIIIIIIIIIIIIIIIIIII",
+            ),
+            (
+                "bloom_boundary",
+                "GGGGGGGGGGTTTTTTTTTTT",
+                "IIIIIIIIIIIIIIIIIIIII",
+            ),
+        ],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--threads")
+        .arg("4")
+        .assert()
+        .success();
+
+    let exact_matches = fs::read_to_string(&matched_path).unwrap();
+    assert!(exact_matches.contains("exact_boundary"));
+    assert!(exact_matches.contains("bloom_boundary"));
+
+    fs::remove_file(&matched_path).unwrap();
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--threads")
+        .arg("4")
+        .arg("--fpr")
+        .arg("0.01")
+        .assert()
+        .success();
+
+    let bloom_matches = fs::read_to_string(&matched_path).unwrap();
+    assert!(bloom_matches.contains("exact_boundary"));
+    assert!(bloom_matches.contains("bloom_boundary"));
+}
+
+#[test]
+fn test_periodic_reference_compaction_preserves_kmer_phases() {
+    let temp = TempDir::new().unwrap();
+    let ref_path = temp.path().join("periodic.fa");
+    let reads_path = temp.path().join("reads.fq");
+    let matched_path = temp.path().join("matched.fq");
+
+    let reference = "AC".repeat(2048);
+    create_fasta(&ref_path, &[("periodic", &reference)]).unwrap();
+    create_fastq(
+        &reads_path,
+        &[
+            ("phase0", "ACACACACACACACACACACA", "IIIIIIIIIIIIIIIIIIIII"),
+            ("phase1", "CACACACACACACACACACAC", "IIIIIIIIIIIIIIIIIIIII"),
+        ],
+    )
+    .unwrap();
+
+    nucleaze_cmd()
+        .arg("--in")
+        .arg(&reads_path)
+        .arg("--ref")
+        .arg(&ref_path)
+        .arg("--outm")
+        .arg(&matched_path)
+        .arg("--k")
+        .arg("21")
+        .arg("--threads")
+        .arg("4")
+        .assert()
+        .success();
+
+    let matches = fs::read_to_string(&matched_path).unwrap();
+    assert!(matches.contains("phase0"));
+    assert!(matches.contains("phase1"));
+}
+
+#[test]
 fn test_interleaved_input_separate_output() {
     let temp = TempDir::new().unwrap();
     let ref_path = temp.path().join("ref.fa");

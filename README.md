@@ -74,6 +74,12 @@ This command:
 
 ---
 
+## **Performance Research**
+
+The [plain-language optimization report](OPTIMIZATION_REPORT_SIMPLE.md) summarizes what changed, why it helped, and how the result was validated. The [full July 2026 optimization report](OPTIMIZATION_REPORT.md) contains the detailed measurements, rejected experiments, memory tradeoffs, and reproducible benchmark results.
+
+---
+
 ## **License**
 
 This project is licensed under the MIT License, see [LICENSE](LICENSE) for details. There is lots of room for improvement here so new additions or suggestions are welcome!
