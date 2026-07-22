@@ -1,6 +1,8 @@
 ![Topic](https://img.shields.io/badge/bioinformatics-sequence_decontamination-blue)
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/jackdougle/nucleaze/rust.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE) 
+[![crates.io](https://img.shields.io/crates/v/nucleaze.svg?label=crates.io)](https://crates.io/crates/nucleaze)
+[![Rust forum](https://img.shields.io/badge/Rust_forum-blog_post-orange?logo=rust)](https://users.rust-lang.org/t/introducing-nucleaze-fast-multi-threaded-k-mer-sequence-filtration/138630)
 
 # **Nucleaze 🧬**
 A high-performance Rust tool for filtering DNA/RNA reads based on a set of reference k-mers.
@@ -10,12 +12,16 @@ Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bb
 
 ## **Features and Default Behavior**
 
-**K-mer based read filtering**:  
+**Sequence filtration w/ k-mers**:  
 - Reads are compared to reference sequences by matching k-mers.
 - If a read sequence has at least x k-mers also found in reference dataset, it is a match
   - x is 1 by default, changed with `--minhits <int>`
 
-**Piping**:
+**Approximate mode w/ Bloom filters**:
+- Uses a Bloom filter to reduce memory usage, with a configurable false-positive rate
+- Enable with `--fpr <rate>` (for example, `--fpr 0.01`); exact mode is the default
+
+**Input/output modes**:
 - Reads from stdin by default (or use `--in -` explicitly)
 - Use `--outm`/`--outu`/`--outm2`/`--outu2` `stdout.fa`/`stdout.fq` to pipe results to stdout
 
@@ -24,14 +30,14 @@ Inspired by [BBDuk](https://archive.jgi.doe.gov/data-and-tools/software-tools/bb
 - Interleaved inputs or outputs, signify interleaved input with `--interinput`
 - Automatic detection of input/output mode
 
-**Multithreading with Rayon**:  
+**Multithreading**:  
 - Adjustable thread count via `--threads` argument  
 - Defaults to all available CPU cores
 
-**Memory Limit**:  
+**Memory limit**:  
 - Specify maximum memory usage with `--maxmem <String>` (e.g., `5G` for 5 gigabytes, `500M` for 500 megabytes)  
 
-**Automatic Reference Indexing**:  
+**De/serializing references**:  
 - Builds a serialized reference k-mer index using Bincode if `--binref <file>` is provided from references provided with `--ref <file>`
 - Uses saved index on subsequent runs if `--binref <file>` is included
 
@@ -92,4 +98,4 @@ This project is licensed under the MIT License, see [LICENSE](LICENSE) for detai
 
 ---
 
-#### Please email jack.gdouglass@gmail.com with any questions or feature requests.
+#### Please email jgddouglass@gmail.com with any questions or feature requests.
